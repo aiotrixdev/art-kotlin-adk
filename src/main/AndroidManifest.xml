@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        The library makes outbound HTTP/WebSocket/SSE connections so it must
+        request INTERNET permission. Declared here (rather than relying on the
+        consumer) so the library is self-contained.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application>
+        <!-- No components: pure SDK library. -->
+    </application>
+
+</manifest>
