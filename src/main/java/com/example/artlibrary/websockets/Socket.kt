@@ -1,350 +1,318 @@
-package com.example.artlibrary.websockets
-
+import android.app.usage.UsageEvents
 import android.os.Build
+import android.util.Log
 import androidx.annotation.RequiresApi
 import com.example.artlibrary.auth.Auth
-import com.example.artlibrary.config.AdkLog
-import com.example.artlibrary.config.ChannelTypes
 import com.example.artlibrary.config.Constant
-import com.example.artlibrary.config.Events
-import com.example.artlibrary.config.HttpClientProvider
-import com.example.artlibrary.config.ReservedChannels
-import com.example.artlibrary.config.ReturnFlags
 import com.example.artlibrary.types.AuthenticationConfig
 import com.example.artlibrary.types.ChannelConfig
 import com.example.artlibrary.types.ConnectionDetail
 import com.example.artlibrary.types.IWebsocketHandler
+import com.example.artlibrary.websockets.EventEmitter
+import com.example.artlibrary.websockets.Interception
+import com.example.artlibrary.websockets.LiveObjSubscription
+import com.example.artlibrary.websockets.Subscription
+import com.example.artlibrary.websockets.subscribeToChannel
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import org.json.JSONObject
-import java.util.Collections
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.net.URLEncoder
+import java.util.*
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
-private const val TAG = "ArtSocket"
 
-/**
- * Concrete transport handler used by [Adk]. Owns the WebSocket connection,
- * the SSE fallback, the long-poll fallback, the per-channel subscription
- * registry and the secure-line callback table.
- *
- * Concurrency model:
- *  - All mutable collections are concurrent containers.
- *  - The WebSocket lifecycle is guarded by [connectionMutex] so that
- *    overlapping `connect`, `pause`, `resume` and `close` calls cannot
- *    interleave half-states.
- *  - The internal coroutine scope is exposed via [release] which cancels
- *    everything when the SDK is shut down.
- */
 class Socket private constructor(
     private val encryptFn: suspend (data: String, recipientPublicKey: String) -> String,
-    private val decryptFn: suspend (encryptedHash: String, senderPublicKey: String) -> String
+    private val decryptFn: suspend (encryptedHash: String, senderPublicKey: String) -> String,
+    private val lpClient: LongPollClient
 ) : EventEmitter(), IWebsocketHandler {
 
     private var websocket: WebSocket? = null
     private lateinit var credentials: AuthenticationConfig
-
-    private val subscriptions: MutableMap<String, BaseSubscription> = ConcurrentHashMap()
-    private val interceptors = ConcurrentHashMap<String, Interception>()
-    private val pendingIncomingMessages =
-        ConcurrentHashMap<String, MutableList<IncomingMessage>>()
-    private val pendingSendMessages: MutableList<String> =
-        Collections.synchronizedList(mutableListOf())
-    val secureCallbacks = ConcurrentHashMap<String, (Any?) -> Unit>()
-
+    private val subscriptions: MutableMap<String, BaseSubscription> = mutableMapOf()
+    private val interceptors = mutableMapOf<String, Interception>()
     private var connection: ConnectionDetail? = null
+    var isConnectionActive = false
+    private var heartbeatInterval: Timer? = null
 
-    @Volatile
-    var isConnectionActive: Boolean = false
-    @Volatile
-    var isReConnecting: Boolean = false
+    val pendingSendMessges = mutableListOf<String>()
+    val secureCallbacks = mutableMapOf<String, (Any?) -> Unit>()
+    private val pendingIncomingMessages = mutableMapOf<String, MutableList<IncomingMessage>>()
 
-    private var pullSource: String = "socket"
-    private var pushSource: String = "socket"
-
-    @Volatile
-    private var isConnecting: Boolean = false
-    @Volatile
-    private var autoReconnect: Boolean = false
-
+    protected var pullSource: String = "socket"
+    protected var pushSource: String = "socket"
+    private var isConnecting = false
+    var isReConnecting = false
+    private var autoReconnect = false
     private val gson = Gson()
-    private val okHttpClient = HttpClientProvider.webSocket
-    private val sseClient = HttpClientProvider.sse
-
-    private val connectionMutex = Mutex()
-    private val socketScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var heartbeatJob: Job? = null
-
-    /** Late-bound long-poll client; created via [create] before publication. */
-    internal lateinit var longPollClient: LongPollClient
+    private val okHttpClient = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
 
     companion object {
 
         @RequiresApi(Build.VERSION_CODES.O)
         fun create(
-            encrypt: suspend (String, String) -> String,
-            decrypt: suspend (String, String) -> String
+            encrypt: suspend (String, String) -> String, decrypt: suspend (String, String) -> String
         ): Socket {
-            val socket = Socket(encrypt, decrypt)
-            // Build the long-poll client AFTER the socket exists so we can
-            // safely capture a real reference instead of patching a mutable
-            // var from a callback closure.
-            val lp = LongPollClient(
-                opts = LongPollOptions(
-                    endpoint = Constant.LPOLL,
-                    getAuthHeaders = suspend {
-                        val auth = Auth.getInstance()
-                        val authData = auth.authenticate()
-                        val creds = auth.getCredentials()
-                        mapOf(
-                            "Authorization" to "Bearer ${authData.accessToken}",
-                            "X-Org" to creds.orgTitle,
-                            "Environment" to creds.environment,
-                            "ProjectKey" to creds.projectKey
-                        )
-                    },
-                    onMessages = { msgs ->
-                        socket.socketScope.launch {
-                            socket.processIncomingMessages(msgs)
-                        }
-                    },
-                    onError = { err ->
-                        AdkLog.e("ArtLongPoll", "error: ${err.message}", err)
+            var socketRef: Socket? = null
+            val lp = LongPollClient(opts = LongPollOptions(endpoint = Constant.LPOLL,
+                getAuthHeaders = suspend {
+                    val auth = Auth.getInstance()
+                    auth.authenticate()
+                    val authData = auth.getAuthData()
+                    val creds = auth.getCredentials()
+                    mapOf(
+                        "Authorization" to "Bearer ${authData.accessToken}",
+                        "X-Org" to creds.orgTitle,
+                        "Environment" to creds.environment,
+                        "ProjectKey" to creds.projectKey
+                    )
+                }, onMessages = { msgs ->
+                    CoroutineScope(Dispatchers.IO).launch {
+                        socketRef?.processIncomingMessages(msgs)
                     }
-                )
+                },
+                onError = { err ->
+                    Log.e("LP error:", "$err")
+                })
             )
-            socket.longPollClient = lp
+            val socket = Socket(encrypt, decrypt, lp)
+            socketRef = socket
             return socket
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
     suspend fun initiateSocket(credentials: AuthenticationConfig) {
-        if (websocket != null && isConnectionActive) return
+        // 1. Guard clause: Check if already active
+        if (this.websocket != null && this.isConnectionActive) return
 
         this.credentials = credentials
         connectWebSocket()
-
-        // SSE / long-poll fallbacks are best-effort and intentionally tolerant.
+        // 3. Attempt SSE (Server-Sent Events) Connection
         try {
             connectSSE()
             this.pullSource = "sse"
             this.pushSource = "http"
             return
-        } catch (e: Exception) {
-            AdkLog.w(TAG, "SSE failed, falling back to HTTP poll: ${e.message}")
+        } catch (sseErr: Exception) {
+            println("SSE failed, falling back to HTTP poll: ${sseErr.message}")
         }
 
+        // 4. Fallback to HTTP Polling
         this.pullSource = "http"
         this.pushSource = "http"
-        longPollClient.start(connection?.connectionId)
+        this.lpClient.start(this.connection?.connectionId)
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
-    suspend fun connectWebSocket() = connectionMutex.withLock {
-        if (isConnecting) return@withLock
+    suspend fun connectWebSocket() {
+        if (isConnecting) return
         isConnecting = true
 
         val auth = Auth.getInstance(credentials)
         val authData = auth.authenticate()
 
-        try {
-            suspendCancellableCoroutine<Unit> { cont ->
-                // Authenticate via headers, NOT via query parameters, so the
-                // bearer token never lands in proxy / server access logs.
-                val request = Request.Builder()
-                    .url(Constant.WS_URL)
-                    .addHeader("Authorization", "Bearer ${authData.accessToken}")
-                    .addHeader("X-Org", credentials.orgTitle)
-                    .addHeader("Environment", credentials.environment)
-                    .addHeader("ProjectKey", credentials.projectKey)
-                    .apply {
-                        connection?.connectionId
-                            ?.takeIf { it.isNotEmpty() }
-                            ?.let { addHeader("X-Connection-Id", it) }
-                    }
-                    .build()
+        suspendCancellableCoroutine<Unit> { cont ->
 
-                AdkLog.d(TAG, "Opening WebSocket to ${Constant.WS_URL}")
+            val params = mutableMapOf(
+                "connection_id" to (connection?.connectionId ?: ""),
+                "Org-Title" to credentials.orgTitle,
+                "token" to authData.accessToken,
+                "environment" to credentials.environment,
+                "project-key" to credentials.projectKey
+            )
 
-                websocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
-                    override fun onOpen(ws: WebSocket, response: Response) {
-                        isConnecting = false
-                        // Connection is *open* but the protocol-level
-                        // 'art_ready' has not yet arrived; do not flip
-                        // isConnectionActive here — wait() listens for the
-                        // connection event and resumes its callers then.
-                        isConnectionActive = false
-                        if (cont.isActive) cont.resume(Unit) {}
-                    }
+            val query = params.map {
+                "${it.key}=${URLEncoder.encode(it.value, "UTF-8")}"
+            }.joinToString("&")
 
-                    override fun onMessage(ws: WebSocket, text: String) {
-                        socketScope.launch { parseIncomingMessage(text) }
-                    }
+            val fullWsUrl = "${Constant.WS_URL}?$query"
 
-                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                        AdkLog.e(TAG, "WebSocket failure: ${t.message}", t)
-                        val isTimeout = t is java.net.SocketTimeoutException
-                        if (isTimeout) {
-                            AdkLog.w(TAG, "WebSocket ping timeout — will reconnect")
-                        } else {
-                            AdkLog.e(TAG, "WebSocket failure: ${t.message}", t)
-                        }
-                        isConnecting = false
-                        isConnectionActive = false
-                        if (cont.isActive) cont.resumeWith(Result.failure(t))
-                        emit(Events.ERROR, t)
-                        emit(Events.CLOSE, mapOf("type" to "failure"))
-                    }
+            Log.d("WS_URL", fullWsUrl)
 
-                    override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                        AdkLog.d(TAG, "WebSocket closed code=$code reason=$reason")
-                        isConnectionActive = false
-                        isConnecting = false
-                        emit(
-                            Events.CLOSE,
-                            mapOf("type" to "closed", "code" to code, "reason" to reason)
-                        )
+            val request = Request.Builder().url(fullWsUrl).build()
+
+            websocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
+
+                override fun onOpen(ws: WebSocket, response: Response) {
+                    isConnecting = false
+                    isConnectionActive = false // WAIT for art_ready
+                    cont.resume(Unit) {}
+                }
+
+                override fun onMessage(ws: WebSocket, text: String) {
+                    Log.d("Web socket MESSAGE ", text)
+
+                    CoroutineScope(Dispatchers.IO).launch {
+                        parseIncomingMessage(text)
                     }
-                })
-            }
-        } catch (e: Exception) {
-            isConnecting = false
-            throw e
+                }
+
+                override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                    Log.e("WS_FAIL", t.message ?: "error", t)
+                    if (cont.isActive) cont.resumeWith(Result.failure(t))
+                }
+
+                override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                    isConnectionActive = false
+                    isConnecting = false
+                }
+            })
         }
     }
 
-    /**
-     * Performs a graceful WebSocket close. OkHttp does not support swapping
-     * a listener after `newWebSocket`, so we use the existing listener's
-     * `onClosed` callback (which already toggles `isConnectionActive`) and
-     * just poll for completion under a timeout.
-     */
-    private suspend fun safeClose(timeout: Long = 1_000L) {
+    private suspend fun safeClose(timeout: Long = 1000L) {
         val ws = websocket ?: return
-        runCatching { ws.close(1000, "Normal Closure") }
-        withTimeoutOrNull(timeout) {
-            while (isConnectionActive) delay(20)
+
+        return withTimeoutOrNull(timeout) {
+
+            suspendCancellableCoroutine<Unit> { continuation ->
+
+                val listener = object : WebSocketListener() {
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        websocket = null
+                        if (continuation.isActive) {
+                            continuation.resume(Unit) {}
+                        }
+                    }
+                }
+
+                try {
+                    ws.close(1000, "Normal Closure")
+                } catch (_: Exception) {
+                    if (continuation.isActive) {
+                        continuation.resume(Unit) {}
+                    }
+                }
+            }
+        } ?: run {
+            websocket = null
         }
-        websocket = null
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
     suspend fun connectSSE() {
+
         val auth = Auth.getInstance(credentials)
 
         val authData = try {
             auth.authenticate()
         } catch (err: Exception) {
-            AdkLog.e(TAG, "SSE authentication failed", err)
-            emit(Events.CLOSE, mapOf("type" to "error"))
+            println("Authentication failed: $err")
+            emit("close", mapOf("type" to "error"))
             return
         }
 
-        val httpUrl = Constant.SSE_URL.toHttpUrl().newBuilder().build()
+        // Build params
+        val params = mapOf(
+            "Org-Title" to credentials.orgTitle,
+            "token" to authData.accessToken,
+            "environment" to credentials.environment,
+            "project-key" to credentials.projectKey
+        )
 
-        val request = Request.Builder()
-            .url(httpUrl)
-            .addHeader("Accept", "text/event-stream")
-            .addHeader("Authorization", "Bearer ${authData.accessToken}")
-            .addHeader("X-Org", credentials.orgTitle)
-            .addHeader("Environment", credentials.environment)
-            .addHeader("ProjectKey", credentials.projectKey)
+        val httpUrl = Constant.SSE_URL.toHttpUrl().newBuilder()
+
+            .addQueryParameter("Org-Title", credentials.orgTitle)
+
+            .addQueryParameter("token", authData.accessToken)
+
+            .addQueryParameter("environment", credentials.environment)
+
+            .addQueryParameter("project-key", credentials.projectKey)
+
             .build()
 
-        val openSignal = CompletableDeferred<Unit>()
-        val factory = EventSources.createFactory(sseClient)
+        val request = Request.Builder()
+
+            .url(httpUrl)
+
+            .addHeader("Accept", "text/event-stream")
+
+            .build()
+
+        val okHttpClient = OkHttpClient()
+
+        val factory = EventSources.createFactory(okHttpClient)
+
         factory.newEventSource(request, object : EventSourceListener() {
+
             override fun onOpen(eventSource: EventSource, response: Response) {
+
                 isConnectionActive = true
-                emit(Events.OPEN, Unit)
-                if (!openSignal.isCompleted) openSignal.complete(Unit)
+
+                emit("open", UsageEvents.Event())
+
             }
 
             override fun onEvent(
-                eventSource: EventSource,
-                id: String?,
-                type: String?,
-                data: String
+                eventSource: EventSource, id: String?, type: String?, data: String
             ) {
-                socketScope.launch { parseIncomingMessage(data) }
+
+                CoroutineScope(Dispatchers.IO).launch {
+
+                    parseIncomingMessage(data)
+
+                }
+
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                emit(Events.ERROR, t)
-                if (!openSignal.isCompleted) {
-                    openSignal.completeExceptionally(
-                        t ?: IllegalStateException("SSE failed to open")
-                    )
-                }
+                emit("error", t)
+
             }
 
             override fun onClosed(eventSource: EventSource) {
+
                 isConnectionActive = false
+
             }
+
         })
 
-        // Wait briefly for the SSE handshake. If it doesn't open in time we
-        // throw, which lets the caller fall back to long-polling.
-        withTimeoutOrNull(5_000) { openSignal.await() }
-            ?: throw IllegalStateException("SSE handshake timed out")
     }
 
     private fun handleConnectionBinding(data: String) {
         setAutoReconnect(true)
 
         val json = JSONObject(data)
+
         connection = ConnectionDetail(
-            connectionId = json.optString("connection_id"),
-            instanceId = json.optString("instance_id"),
+            connectionId = json["connection_id"] as String,
+            instanceId = json["instance_id"] as String,
             tenantName = credentials.orgTitle,
             environment = credentials.environment,
             projectKey = credentials.projectKey
         )
 
-        emit(Events.CONNECTION, connection)
+
+        emit("connection", connection)
+
         isConnectionActive = true
 
         startHeartbeat()
-        drainPendingMessages()
 
         if (autoReconnect) {
-            subscriptions.values.forEach { it.reconnect() }
-            interceptors.values.forEach { it.reconnect() }
-        }
-    }
 
-    private fun drainPendingMessages() {
-        synchronized(pendingSendMessages) {
-            if (pendingSendMessages.isEmpty()) return
-            val ws = websocket ?: return
-            val iterator = pendingSendMessages.iterator()
-            while (iterator.hasNext()) {
-                val msg = iterator.next()
-                ws.send(msg)
-                iterator.remove()
+            subscriptions.forEach { (_, subscriptionInstance) ->
+                subscriptionInstance.reconnect()
+            }
+
+            interceptors.forEach { (_, interceptorInstance) ->
+                interceptorInstance.reconnect()
             }
         }
     }
@@ -354,6 +322,7 @@ class Socket private constructor(
         data: Any,
         listen: Boolean
     ): Any? {
+
         val refId = "${connection?.connectionId}_secure_${System.currentTimeMillis()}_${
             UUID.randomUUID().toString().take(6)
         }"
@@ -362,19 +331,25 @@ class Socket private constructor(
             "from" to (connection?.connectionId ?: ""),
             "ref_id" to refId,
             "event" to event,
-            "channel" to ReservedChannels.ART_SECURE,
-            "content" to gson.toJson(data)
+            "channel" to "art_secure",
+            "content" to gson.toJson(data ?: emptyMap<String, Any>())
         )
 
+
         return if (listen) {
+
             suspendCancellableCoroutine { cont ->
-                val key = "secure-$refId"
-                secureCallbacks[key] = { response ->
-                    if (cont.isActive) cont.resume(response)
+
+                secureCallbacks["secure-$refId"] = { response ->
+
+                    if (cont.isActive) {
+                        cont.resume(response)
+                    }
                 }
-                cont.invokeOnCancellation { secureCallbacks.remove(key) }
+
                 sendMessage(gson.toJson(message))
             }
+
         } else {
             sendMessage(gson.toJson(message))
             null
@@ -382,86 +357,123 @@ class Socket private constructor(
     }
 
     override suspend fun removeSubscription(channel: String) {
-        subscriptions.remove(channel)
+        this.subscriptions.remove(channel)
     }
 
-    suspend fun subscribe(channel: String): BaseSubscription = handleSubscription(channel)
+    suspend fun subscribe(channel: String): BaseSubscription {
+        return handleSubscription(channel)
+    }
 
     private suspend fun handleSubscription(channel: String): BaseSubscription {
+
         wait()
 
         val connectionId: String = connection?.connectionId ?: ""
 
-        subscriptions[channel]?.let { existing ->
-            existing.subscribe()
-            return existing
+        // Check if subscription already exists
+        if (subscriptions.containsKey(channel)) {
+
+            val sub = subscriptions[channel]!!
+
+            // same connection → just resubscribe
+            sub.subscribe()
+
+            return sub
         }
 
         val channelConfig = validateSubscription(channel, "subscribe")
-            ?: throw IllegalStateException("Channel $channel not found")
+            ?: throw Exception("Channel $channel not found")
 
-        val subscription: BaseSubscription =
-            if (channelConfig.channelType == ChannelTypes.SHARED_OBJECT) {
-                LiveObjSubscription(connectionId, channelConfig, this, "subscribe")
-            } else {
-                Subscription(connectionId, channelConfig, this, "subscribe")
-            }
+        val subscription: BaseSubscription = if (channelConfig.channelType == "shared-object") {
+            LiveObjSubscription(connectionId, channelConfig, this, "subscribe")
+        } else {
+            Subscription(connectionId, channelConfig, this, "subscribe")
+        }
 
         subscriptions[channel] = subscription
 
-        pendingIncomingMessages.remove(channel)?.forEach { msg ->
-            subscription.handleMessage(msg.event, msg.payload)
+        val buf = pendingIncomingMessages[channel]
+
+        if (buf != null) {
+            for (msg in buf) {
+                val event = msg.event
+                val payload = msg.payload
+                subscription.handleMessage(event, payload)
+            }
+
+            pendingIncomingMessages.remove(channel)
         }
 
         return subscription
     }
 
+
     suspend fun validateSubscription(channelName: String, process: String): ChannelConfig? {
-        if (channelName in ReservedChannels.SYSTEM) {
+        if (listOf("art_config", "art_secure").contains(channelName)) {
             return ChannelConfig(
                 channelName = channelName,
                 channelNamespace = "",
-                channelType = ChannelTypes.DEFAULT,
+                channelType = "default",
                 presenceUsers = emptyList(),
                 snapshot = null,
                 subscriptionID = ""
             )
         }
-        return subscribeToChannel(channelName, process, this)
+        return try {
+            subscribeToChannel(
+                channelName, process, this
+            )
+        } catch (e: Exception) {
+            throw e
+        }
     }
 
-    override fun getConnection(): ConnectionDetail? = connection
+    override fun getConnection(): ConnectionDetail? {
+        return connection
+    }
 
     /**
-     * Registers a server interceptor binding. Subsequent calls with the same
-     * name return the existing instance.
+     * Register interceptor.
+     * @param interceptor The interceptor name to register to.
+     * @param fn The interceptor function.
+     * @return Interception instance.
      */
     suspend fun intercept(
         interceptor: String,
         fn: (payload: Any?, resolve: (Any?) -> Unit, reject: (Any?) -> Unit) -> Unit
     ): Interception {
+
         wait()
 
-        interceptors[interceptor]?.let { return it }
+        // If interceptor already exists, return it
+        if (interceptors.containsKey(interceptor)) {
+            return interceptors[interceptor]!!
+        }
 
+        // Create a new Interception instance
         val interception = Interception(interceptor, fn, this)
-        interception.validateInterception()
-        interceptors[interceptor] = interception
-        return interception
+
+        try {
+            interception.validateInterception()
+            interceptors[interceptor] = interception
+            return interception
+        } catch (error: Exception) {
+            throw error
+        }
     }
 
     suspend fun parseIncomingMessage(message: String) {
         try {
             val type = object : TypeToken<Any>() {}.type
             val parsed = gson.fromJson<Any>(message, type)
+
             if (parsed is List<*>) {
-                @Suppress("UNCHECKED_CAST")
                 processIncomingMessages(parsed as List<Any>)
             } else {
                 handleIncomingMessage(parsed)
             }
         } catch (e: Exception) {
-            AdkLog.e(TAG, "Failed to parse JSON frame", e)
+            Log.e("Socket", "Failed to parse JSON")
         }
     }
 
@@ -470,13 +482,11 @@ class Socket private constructor(
     }
 
     /**
-     * Routes a parsed inbound message to the matching subscription or
-     * interceptor. Buffers messages whose subscription has not yet been
-     * registered.
+     * Handle incoming WebSocket messages and route them to the appropriate Subscription.
+     * @param message The raw message received from the WebSocket.
      */
     suspend fun handleIncomingMessage(parsedMessage: Any) {
         try {
-            @Suppress("UNCHECKED_CAST")
             val msg = parsedMessage as? MutableMap<String, Any?> ?: return
 
             val channel = msg["channel"] as? String
@@ -487,211 +497,243 @@ class Socket private constructor(
             val interceptorName = msg["interceptor_name"] as? String
             val data = msg["content"]
 
-            // ---- art_ready handshake ----
-            if (channel == ReservedChannels.ART_READY && event == Events.READY) {
+            // Handle connection ready
+            if (channel == "art_ready" && event == "ready") {
                 handleConnectionBinding(data.toString())
                 return
             }
 
-            // ---- secure callback dispatch ----
-            if (channel == ReservedChannels.ART_SECURE) {
+            // Handle secure channel (MOST IMPORTANT FIX AREA)
+            else if (channel == "art_secure") {
+
                 if (refId == null) {
-                    AdkLog.e(TAG, "Secure message missing refId")
+                    Log.e("SECURE_ERROR", "refId is NULL: $msg")
                     return
                 }
+
                 val key = "secure-$refId"
-                val callback = secureCallbacks.remove(key)
-                if (callback == null) {
-                    AdkLog.e(TAG, "No callback for refId=$refId")
-                    return
-                }
+                val callback = secureCallbacks[key]
 
-                @Suppress("UNCHECKED_CAST")
-                val parsedData: Map<String, Any?> = try {
-                    when (data) {
-                        is String -> gson.fromJson(
-                            data,
-                            object : TypeToken<Map<String, Any?>>() {}.type
-                        )
+                if (callback != null) {
 
-                        is Map<*, *> -> data as Map<String, Any?>
-                        else -> emptyMap()
+                    // Parse content safely (STRING → MAP)
+                    val parsedData: Map<String, Any?> = try {
+                        when (data) {
+                            is String -> gson.fromJson(
+                                data,
+                                object :
+                                    com.google.gson.reflect.TypeToken<Map<String, Any?>>() {}.type
+                            )
+
+                            is Map<*, *> -> data as Map<String, Any?>
+                            else -> emptyMap()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("PARSE_ERROR", "Failed to parse content: $data", e)
+                        emptyMap()
                     }
-                } catch (e: Exception) {
-                    AdkLog.e(TAG, "Failed to parse secure content", e)
-                    emptyMap()
-                }
 
-                callback.invoke(
-                    mapOf(
+                    // Match TS structure exactly
+                    val response = mapOf(
                         "channel" to channel,
                         "namespace" to namespace,
                         "data" to parsedData,
                         "ref_id" to refId,
                         "event" to event
                     )
-                )
+
+                    Log.d("SECURE_FLOW", "Invoking callback for $refId")
+
+                    callback.invoke(response)
+                    secureCallbacks.remove(key)
+
+                } else {
+                    Log.e("SECURE_ERROR", "No callback found for refId: $refId")
+                }
+
                 return
             }
 
-            if (channel == null || (event == null && returnFlag != ReturnFlags.SERVER_ACK)) {
-                AdkLog.w(TAG, "Received message without channel or event")
+            // Validate message
+            if (channel == null || (event == null && returnFlag != "SA")) {
+                Log.w("Socket", "Received message without channel or event: $msg")
                 return
             }
 
-            if (event == Events.SHIFT_TO_HTTP) {
+            // Shift to HTTP
+            if (event == "shift_to_http") {
                 switchToHttpPoll()
                 return
             }
 
-            if (event == Events.ERROR) {
-                AdkLog.e(TAG, "Server error event received")
+            // Error log
+            if (event == "error") {
+                Log.e("Socket", "Received error message: $msg")
             }
 
-            // Replace `content` -> `data` to match the rest of the SDK.
+            // Replace content → data (like JS)
             msg.remove("content")
             msg["data"] = data
 
-            // ---- interceptor routing ----
+            // Interceptor handling
             if (!interceptorName.isNullOrEmpty()) {
+
                 val interception = interceptors[interceptorName]
+
                 if (interception != null) {
                     interception.handleMessage(channel, msg)
                 } else {
-                    AdkLog.w(TAG, "No Interception found for channel: $channel")
+                    Log.w("Socket", "No Interception found for channel: $channel")
                 }
-                return
-            }
 
-            // ---- subscription routing ----
-            // The subscription registry is keyed by the *bare* channel name,
-            // so a namespaced lookup must fall back to the bare channel
-            // when no namespaced subscription is registered. The original
-            // port silently dropped namespaced messages.
-            val namespacedKey = if (!namespace.isNullOrEmpty()) "$channel:$namespace" else channel
-            val subscription = subscriptions[namespacedKey] ?: subscriptions[channel]
+            } else {
 
-            if (subscription != null) {
-                when (subscription) {
-                    is Subscription -> subscription.handleMessage(event ?: "", msg)
-                    is LiveObjSubscription -> {
+                //Subscription handling
+                var subscriptionKey = channel
+
+                if (!namespace.isNullOrEmpty()) {
+                    subscriptionKey += ":$namespace"
+                }
+
+                val subscription = subscriptions[subscriptionKey]
+
+                if (subscription != null) {
+
+                    if (subscription is Subscription) {
+                        subscription.handleMessage(event ?: "", msg)
+                    } else if (subscription is LiveObjSubscription) {
                         @Suppress("UNCHECKED_CAST")
                         subscription.handleMessage(event ?: "", msg as MutableMap<String, Any>)
+                    } else {
+                        subscription.handleMessage(event ?: "", msg)
                     }
 
-                    else -> subscription.handleMessage(event ?: "", msg)
+                } else {
+
+                    Log.w(
+                        "Socket",
+                        "No subscription found for channel: $subscriptionKey, adding to buffer"
+                    )
+
+                    val arr =
+                        pendingIncomingMessages.getOrPut(subscriptionKey) { mutableListOf() }
+
+                    arr.add(IncomingMessage(event ?: "", msg))
                 }
-            } else {
-                AdkLog.w(TAG, "No subscription for $namespacedKey, buffering")
-                val arr = pendingIncomingMessages.getOrPut(namespacedKey) { mutableListOf() }
-                synchronized(arr) { arr.add(IncomingMessage(event ?: "", msg)) }
             }
 
         } catch (e: Exception) {
-            AdkLog.e(TAG, "Failed to handle incoming message", e)
+            Log.e("Socket", "Failed to parse incoming message", e)
         }
     }
 
     private fun switchToHttpPoll() {
-        if (pullSource == "http") return
-        pullSource = "http"
-        pushSource = "http"
-        longPollClient.start(connection?.connectionId.orEmpty())
+        if (this.pullSource == "http") return
+        this.pullSource = "http"
+        this.pushSource = "http"
+        this.lpClient.start(this.connection?.connectionId ?: "")
     }
 
-    /** Sends a frame on the WebSocket, queueing it if not yet connected. */
+    /**
+     * Send a message through the WebSocket.
+     * @param message The message to send.
+     */
     override fun sendMessage(message: String) {
-        val ws = websocket
-        if (ws != null && isConnectionActive) {
-            ws.send(message)
+        Log.d("WS_SEND", message)
+        if (websocket != null && isConnectionActive) {
+            websocket!!.send(message)
         } else {
-            pendingSendMessages.add(message)
+            pendingSendMessges.add(message)
         }
     }
 
     fun setAutoReconnect(value: Boolean) {
-        autoReconnect = value
+        this.autoReconnect = value
     }
 
-    /**
-     * Closes the WebSocket and (optionally) clears every piece of session
-     * state. Use [release] when you intend to dispose of the SDK instance.
-     */
     suspend fun closeWebSocket(clearConnection: Boolean = false) {
         safeClose()
+
         isConnectionActive = false
         connection = null
         isConnecting = false
 
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-
         if (clearConnection) {
             pendingIncomingMessages.clear()
-            synchronized(pendingSendMessages) { pendingSendMessages.clear() }
-            subscriptions.values.forEach { it.release() }
+            pendingSendMessges.clear()
             subscriptions.clear()
-            interceptors.values.forEach { it.release() }
             interceptors.clear()
-            secureCallbacks.clear()
+        }
+
+        heartbeatInterval?.let {
+            //  clearInterval(it)
+            heartbeatInterval = null
         }
     }
 
-    /**
-     * Releases every resource owned by this socket. After calling, the
-     * instance must not be used again.
-     */
-    suspend fun release() {
-        closeWebSocket(clearConnection = true)
-        runCatching { longPollClient.release() }
-        socketScope.cancel()
-    }
 
     override suspend fun wait() {
+
         if (isConnectionActive) return
-        suspendCancellableCoroutine<Unit> { cont ->
+
+        suspendCancellableCoroutine<Unit> { continuation ->
+
             lateinit var listener: (Any?) -> Unit
+
             listener = {
-                off(Events.CONNECTION, listener)
-                if (cont.isActive) cont.resume(Unit)
+                off("connection", listener)
+                continuation.resume(Unit)
             }
-            on(Events.CONNECTION, listener)
-            cont.invokeOnCancellation { off(Events.CONNECTION, listener) }
+
+            on("connection", listener)
         }
     }
 
-    private fun heartbeatPayload(): Map<String, Any?> {
+    private fun _runHeartBeatPayload(): Map<String, Any?> {
         val subList = subscriptions.map { (key, sub) ->
             mapOf(
                 "name" to key,
-                "presenceTracking" to sub.isListening
+                (("presenceTracking" to sub.isListening) ?: false) as Pair<Any, Any>,
             )
         }
         return mapOf(
-            "connectionId" to connection?.connectionId,
+            "connectionId" to this.connection?.connectionId,
             "timestamp" to System.currentTimeMillis(),
             "subscriptions" to subList
         )
     }
 
     private fun startHeartbeat() {
-        if (heartbeatJob?.isActive == true) return
-        heartbeatJob = socketScope.launch {
-            while (isActive) {
-                delay(30_000)
-                if (!isConnectionActive) continue
-                runCatching {
-                    pushForSecureLine(Events.HEARTBEAT, heartbeatPayload(), false)
-                }.onFailure { AdkLog.w(TAG, "Heartbeat failed", it) }
+        if (heartbeatInterval != null) return
+        heartbeatInterval = Timer()
+        heartbeatInterval?.schedule(object : TimerTask() {
+            override fun run() {
+                if (!isConnectionActive) return
+                CoroutineScope(Dispatchers.IO).launch {
+                    pushForSecureLine(
+                        "heartbeat", _runHeartBeatPayload(), false
+                    )
+                }
             }
+        }, 30000, 30000)
+    }
+
+    suspend fun waitConnection() {
+        if (this.isConnectionActive) return
+        while (!isConnectionActive) {
+            kotlinx.coroutines.delay(100)
         }
     }
 
-    override suspend fun encrypt(data: Any, recipientPublicKey: String): String =
-        encryptFn(data.toString(), recipientPublicKey)
+    override suspend fun encrypt(data: Any, recipientPublicKey: String): String {
+        return encryptFn(data.toString(), recipientPublicKey)
+    }
 
-    override suspend fun decrypt(encryptedHash: String, senderPublicKey: String): String =
-        decryptFn(encryptedHash, senderPublicKey)
+    override suspend fun decrypt(encryptedHash: String, senderPublicKey: String): String {
+        return decryptFn(encryptedHash, senderPublicKey)
+    }
 
-    data class IncomingMessage(val event: String, val payload: MutableMap<String, Any?>)
+
+    data class IncomingMessage(val event: String, val payload: Any)
 }
+

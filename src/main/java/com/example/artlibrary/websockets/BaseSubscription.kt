@@ -1,15 +1,14 @@
-import android.R.attr
 import android.util.Log
 import com.example.artlibrary.types.ChannelConfig
 import com.example.artlibrary.types.IWebsocketHandler
 import com.example.artlibrary.types.PushConfig
+import com.example.artlibrary.websockets.EventEmitter
 import com.example.artlibrary.websockets.subscribeToChannel
 import com.example.artlibrary.websockets.unsubscribeFromChannel
 import com.google.gson.Gson
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 
 
 open class BaseSubscription(
@@ -30,8 +29,9 @@ open class BaseSubscription(
     private val ACK_TIMEOUT = 50_000L
     private var messageCount = 0
 
+    // FIX: Store both the deferred and the timer Job together, matching JS's { resolve, reject, timer }
     private val pendingAcks =
-        ConcurrentHashMap<String, CompletableDeferred<Any>>()
+        ConcurrentHashMap<String, Pair<CompletableDeferred<Any?>, Job>>()
 
     var presenceUsers =
         channelConfig.presenceUsers.toMutableList()
@@ -49,21 +49,18 @@ open class BaseSubscription(
         if (channelConfig.channelName in listOf("art_config", "art_secure"))
             return
 
-        if (isSubscribed) return // Already subscribed
-
+        // FIX: Removed early `if (isSubscribed) return` guard — JS sets isSubscribed = true then proceeds
         isSubscribed = true
 
         try {
-
-            // Call subscribe_to_channel helper
             val updatedConfig = subscribeToChannel(
                 channelConfig.channelName,
                 "subscribe", this.websocketHandler
             )
             channelConfig = updatedConfig
-            Log.d("subscribeToChannel", "");
+            Log.d("subscribeToChannel", "")
         } catch (error: Exception) {
-            android.util.Log.e("BaseSubscription", "Subscribe error: ${error.message}")
+            Log.e("BaseSubscription", "Subscribe error: ${error.message}")
             isSubscribed = false
         }
     }
@@ -80,13 +77,13 @@ open class BaseSubscription(
             if (success) {
                 websocketHandler.removeSubscription(channelConfig.channelName)
             } else {
-                android.util.Log.e(
+                Log.e(
                     "BaseSubscription",
                     "Failed to unsubscribe from channel ${channelConfig.channelName}"
                 )
             }
         } catch (error: Exception) {
-            android.util.Log.e("BaseSubscription", "Unsubscribe error: ${error.message}")
+            Log.e("BaseSubscription", "Unsubscribe error: ${error.message}")
         }
     }
 
@@ -106,7 +103,7 @@ open class BaseSubscription(
             return
 
         var channelName = channelConfig.channelName
-        channelConfig.channelNamespace?.let {
+        channelConfig.channelNamespace.takeIf { it.isNotBlank() }?.let {
             channelName += ":$it"
         }
 
@@ -121,7 +118,7 @@ open class BaseSubscription(
                 isListening = true
             }
         } catch (error: Exception) {
-            android.util.Log.e("BaseSubscription", "Validate subscription error: ${error.message}")
+            Log.e("BaseSubscription", "Validate subscription error: ${error.message}")
         }
     }
 
@@ -131,6 +128,11 @@ open class BaseSubscription(
         val unique: Boolean = true
     )
 
+    /**
+     * Check for presence on the channel.
+     * @param callback Callback to handle the presence data.
+     * @throws Error if not subscribed for presence.
+     */
     suspend fun fetchPresence(
         callback: (List<String>) -> Unit,
         options: PresenceConfig = PresenceConfig()
@@ -183,13 +185,10 @@ open class BaseSubscription(
                         userResponse.add(user)
                     }
                 }
-
-                Log.d("FetchPresence", "Calling callback with processed users: $userResponse")
                 callback(userResponse)
             }
         }
 
-        Log.d("FetchPresence", "Pushing art_presence request")
         try {
             val result = push("art_presence", emptyMap<String, Any>())
             Log.d("FetchPresence", "Push result: $result")
@@ -203,13 +202,17 @@ open class BaseSubscription(
         }
     }
 
+
     /* ---------------- ACK Handling ---------------- */
 
+    // FIX: Cancel the stored timer Job on ACK receipt, matching JS's clearTimeout(entry.timer)
     fun handleMessageAcks(event: String, returnFlag: String, payload: MutableMap<String, Any?>) {
         if (returnFlag != "SA") return
 
         val refId = payload["ref_id"] as? String ?: return
-        pendingAcks.remove(refId)?.complete(refId)
+        val entry = pendingAcks.remove(refId) ?: return
+        entry.second.cancel()          // cancel the timeout timer
+        entry.first.complete(refId)    // resolve the deferred
     }
 
     /* ---------------- Acknowledge ---------------- */
@@ -253,8 +256,7 @@ open class BaseSubscription(
         val connection = websocketHandler.getConnection()
         val to = options?.to ?: emptyList<String>()
         var messageStr = gson.toJson(data)
-
-// ---- Targeted / Secure validation ----
+        // ---- Targeted / Secure validation ----
         if ((channelConfig.channelType == "secure"
                     || channelConfig.channelType == "targeted")
             && event != "art_presence"
@@ -264,7 +266,7 @@ open class BaseSubscription(
             }
         }
 
-        /* ---- Secure encryption (JS equivalent) ---- */
+        /* ---- Secure encryption ---- */
         if (channelConfig.channelType == "secure"
             && event != "art_presence"
         ) {
@@ -275,12 +277,16 @@ open class BaseSubscription(
                     true
                 )
 
-            val resJson = res as JSONObject
-            val responseData = resJson.getJSONObject("data")
+            val resMap = res as? Map<*, *>
+                ?: throw Exception("Invalid secure response format")
 
-            val status = responseData.getString("status")
+            val responseData = resMap["data"] as? Map<*, *>
+                ?: throw Exception("Missing data in secure response")
+
+            val status = responseData["status"]?.toString()
+
             if (status == "unsuccessfull") {
-                throw Exception(responseData.getString("error"))
+                throw Exception(responseData["error"]?.toString() ?: "Unknown error")
             }
 
             messageStr = websocketHandler.encrypt(
@@ -289,34 +295,37 @@ open class BaseSubscription(
             )
         }
 
-        /* ---- Ref ID ---- */
+        /* ---- Ref ID & ACK Promise ---- */
 
         var refId: String? = null
-        var ackPromise: CompletableDeferred<Any?> = CompletableDeferred()
+        val ackDeferred = CompletableDeferred<Any?>()
 
         if (channelConfig.channelName !in listOf("art_config", "art_secure", "art_presence")) {
 
             messageCount++
+            refId = "${connection?.connectionId}_${channelConfig.channelName}_$messageCount"
 
-            refId =
-                "${connection?.connectionId}_${channelConfig.channelName}_$messageCount"
+            // FIX: Always create the timer, then conditionally store in pendingAcks or resolve immediately
+            // This matches JS: timer is always created, pendingAcks.set only for targeted/secure
+            val timer = scope.launch {
+                delay(ACK_TIMEOUT)
+                pendingAcks.remove(refId)
+                ackDeferred.completeExceptionally(Exception("ACK timeout"))
+            }
 
             if (channelConfig.channelType == "targeted"
                 || channelConfig.channelName == "secure"
             ) {
-
-
-                val timer = CoroutineScope(Dispatchers.IO).launch {
-                    delay(ACK_TIMEOUT)
-                    pendingAcks.remove(refId)
-                    ackPromise.completeExceptionally(Exception("ACK timeout"))
-                }
-
+                // FIX: Store both deferred and timer so handleMessageAcks can cancel the timer
+                pendingAcks[refId!!] = Pair(ackDeferred, timer)
             } else {
-                ackPromise.complete(refId)
+                // Non-targeted: resolve immediately and cancel the timer
+                timer.cancel()
+                ackDeferred.complete(refId)
             }
+
         } else {
-            ackPromise.complete(null)
+            ackDeferred.complete(null)
         }
 
         val message = mapOf(
@@ -324,7 +333,7 @@ open class BaseSubscription(
             "to" to to,
             "channel" to buildString {
                 append(channelConfig.channelName)
-                channelConfig.channelNamespace?.let {
+                channelConfig.channelNamespace.takeIf { it.isNotBlank() }?.let {
                     append(":$it")
                 }
             },
@@ -335,10 +344,19 @@ open class BaseSubscription(
 
         websocketHandler.sendMessage(message.toJson())
 
-        return ackPromise
+        return ackDeferred
     }
 
     open fun handleMessage(event: String, payload: Any) {}
+
+    open fun release() {
+        scope.cancel()
+        pendingAcks.values.forEach { (deferred, timer) ->
+            timer.cancel()
+            deferred.completeExceptionally(Exception("Subscription released"))
+        }
+        pendingAcks.clear()
+    }
 }
 
 /* ---------------- Helpers ---------------- */

@@ -1,65 +1,43 @@
-package com.example.artlibrary.websockets
-
 import android.net.Uri
-import com.example.artlibrary.config.AdkLog
-import com.example.artlibrary.config.HttpClientProvider
 import com.google.gson.Gson
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
-/**
- * HTTP long-polling fallback used when both WebSockets and SSE are
- * unavailable. The client sits in a loop, sending each new request as soon
- * as the previous one returns. On error it backs off; on `204 No Content`
- * it backs off with an exponential delay capped by [LongPollOptions.maxEmptyPollDelayMs].
- *
- * Lifecycle: call [start] to begin polling and [stop] to cancel and release
- * the internal coroutine scope. The class is safe to start/stop repeatedly,
- * but [release] should be called once when the owning SDK instance is being
- * disposed of so that the scope is shut down for good.
- */
 class LongPollClient(private val opts: LongPollOptions) {
 
-    private val client = HttpClientProvider.longPoll
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS) // Long polling needs high timeouts
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    private var connectionId: String? = opts.initialConnectionId
+    private var isRunning = false
+    private var pollingJob: Job? = null
     private val gson = Gson()
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    @Volatile private var connectionId: String? = opts.initialConnectionId
-    @Volatile private var isRunning = false
-    private var pollingJob: Job? = null
-
     fun start(connectionId: String? = null) {
         if (isRunning) return
-        connectionId?.let { this.connectionId = it }
+        if (connectionId != null) {
+            this.connectionId = connectionId
+        }
         isRunning = true
-        pollingJob = scope.launch { pollLoop() }
+
+        // Launch the loop in a background coroutine
+        pollingJob = scope.launch {
+            pollLoop()
+        }
     }
 
     fun stop() {
         isRunning = false
-        pollingJob?.cancel()
-        pollingJob = null
-    }
-
-    /**
-     * Permanently shuts down the client and cancels its internal scope.
-     * After calling this, [start] cannot be used again.
-     */
-    fun release() {
-        stop()
-        scope.cancel()
+        pollingJob?.cancel() // This replaces AbortController
     }
 
     private suspend fun pollLoop() {
@@ -67,46 +45,67 @@ class LongPollClient(private val opts: LongPollOptions) {
 
         while (isRunning && coroutineContext.isActive) {
             try {
-                val url = Uri.parse(opts.endpoint).buildUpon().apply {
-                    connectionId?.let { appendQueryParameter("connection_id", it) }
-                }.build().toString()
+                // 1. Build URL
+                val uriBuilder = Uri.parse(opts.endpoint).buildUpon()
+                connectionId?.let {
+                    uriBuilder.appendQueryParameter("connection_id", it)
+                }
+                val url = uriBuilder.build().toString()
 
+                // Get Auth Headers
                 val authHeaders = opts.getAuthHeaders()
 
+                // Prepare Request
                 val requestBuilder = Request.Builder().url(url)
-                authHeaders.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+                authHeaders.forEach { (key, value) ->
+                    requestBuilder.addHeader(key, value)
+                }
 
-                val response: Response = client.newCall(requestBuilder.build()).execute()
+                // 4. Execute Request
+                val response: Response = withContext(Dispatchers.IO) {
+                    client.newCall(requestBuilder.build()).execute()
+                }
 
                 response.use { resp ->
+                    // Handle 204 No Content
                     if (resp.code == 204) {
                         delay(backoffEmpty)
-                        backoffEmpty = (backoffEmpty * 2)
-                            .coerceAtMost(opts.maxEmptyPollDelayMs.toLong())
-                        return@use
+                        backoffEmpty = (backoffEmpty * 2).coerceAtMost(opts.maxEmptyPollDelayMs.toLong())
+                        return@use // continue loop
                     }
+
                     if (!resp.isSuccessful) {
                         throw IOException("Longpoll error: ${resp.code}")
                     }
 
+                    // Reset backoff on success
                     backoffEmpty = opts.emptyPollDelayMs.toLong()
 
-                    val bodyString = resp.body?.string().orEmpty()
-                    if (bodyString.isEmpty()) return@use
-
+                    val bodyString = resp.body?.string() ?: ""
                     val data = gson.fromJson(bodyString, LongPollResponse::class.java)
-                    if (connectionId == null) connectionId = data.connection_id
 
-                    val msgs = data.messages
-                    if (!msgs.isNullOrEmpty()) {
-                        opts.onMessages(msgs)
+                    // Save connection ID if not present
+                    if (connectionId == null) {
+                        connectionId = data.connection_id
+                    }
+
+                    // Dispatch messages
+                    if (!data.messages.isNullOrEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            opts.onMessages(data.messages)
+                        }
                     }
                 }
+
             } catch (e: CancellationException) {
-                throw e
+                // This happens when stop() or job.cancel() is called
+                break
             } catch (e: Exception) {
-                AdkLog.w("LongPollClient", "Poll error", e)
-                opts.onError?.invoke(e)
+                // Network or Server error
+                withContext(Dispatchers.Main) {
+                    opts.onError?.invoke(e)
+                }
+                // Backoff before retrying after an error
                 delay(opts.retryDelayMs.toLong())
             }
         }
@@ -114,7 +113,7 @@ class LongPollClient(private val opts: LongPollOptions) {
 }
 
 /**
- * Configuration for [LongPollClient].
+ * Supporting Data Classes for Kotlin
  */
 data class LongPollOptions(
     val endpoint: String,
@@ -127,8 +126,6 @@ data class LongPollOptions(
     val maxEmptyPollDelayMs: Int = 5000
 )
 
-/** Server response shape for the long-poll endpoint. */
-@Suppress("PropertyName")
 data class LongPollResponse(
     val connection_id: String,
     val messages: List<Any>?
