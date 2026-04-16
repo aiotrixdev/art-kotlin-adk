@@ -77,10 +77,8 @@ class Adk(config: AdkConfig? = null) {
     suspend fun resume() {
         if (!isPaused) return
         isPaused = false
-        // reset backoff/reconnect
         reconnectAttempts = 0
         reconnectDelay = 3000
-        // new readyPromise so callers can await
         socket.connectWebSocket()
     }
 
@@ -336,7 +334,6 @@ class Adk(config: AdkConfig? = null) {
 
         val jsonResponse = JSONObject(responseBody)
 
-        // Store keypair like JS
         myKeyPair = keyPair
 
         jsonResponse

@@ -375,7 +375,6 @@ class Socket private constructor(
 
             val sub = subscriptions[channel]!!
 
-            // same connection → just resubscribe
             sub.subscribe()
 
             return sub
@@ -571,7 +570,7 @@ class Socket private constructor(
                 Log.e("Socket", "Received error message: $msg")
             }
 
-            // Replace content → data (like JS)
+            // Replace content
             msg.remove("content")
             msg["data"] = data
 

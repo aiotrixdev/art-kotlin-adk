@@ -43,13 +43,10 @@ open class BaseSubscription(
         }
     }
 
-    /* ---------------- Subscription ---------------- */
-
     open suspend fun subscribe() {
         if (channelConfig.channelName in listOf("art_config", "art_secure"))
             return
 
-        // FIX: Removed early `if (isSubscribed) return` guard — JS sets isSubscribed = true then proceeds
         isSubscribed = true
 
         try {
@@ -153,7 +150,6 @@ open class BaseSubscription(
             throw IllegalStateException("Not subscribed for presence")
         }
 
-        Log.d("FetchPresence", "Registering art_presence listener")
         on("art_presence") { payload ->
             Log.d("FetchPresence", "Received art_presence payload: $payload")
             if (payload is Map<*, *>) {
@@ -205,7 +201,6 @@ open class BaseSubscription(
 
     /* ---------------- ACK Handling ---------------- */
 
-    // FIX: Cancel the stored timer Job on ACK receipt, matching JS's clearTimeout(entry.timer)
     fun handleMessageAcks(event: String, returnFlag: String, payload: MutableMap<String, Any?>) {
         if (returnFlag != "SA") return
 
@@ -305,8 +300,6 @@ open class BaseSubscription(
             messageCount++
             refId = "${connection?.connectionId}_${channelConfig.channelName}_$messageCount"
 
-            // FIX: Always create the timer, then conditionally store in pendingAcks or resolve immediately
-            // This matches JS: timer is always created, pendingAcks.set only for targeted/secure
             val timer = scope.launch {
                 delay(ACK_TIMEOUT)
                 pendingAcks.remove(refId)

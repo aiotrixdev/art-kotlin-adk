@@ -476,22 +476,16 @@ class CRDT(
                     type = determineType(converted),
                     value = converted,
                     meta = LDMeta(
-                        updatedAt = now, version = 1,
-                        replicaId = self.clientReplicaId, after = prev
+                        updatedAt = now,
+                        version = 1,
+                        replicaId = self.clientReplicaId,
+                        after = prev
                     )
                 )
-                (self.getContainerAt(parentPath) as? LDArray)?.entries?.set(id, entry)
                 val op = CRDTOperation.ArrayPush(
-                    path = parentPath,
-                    entry = entry,
-                    ref = prev,
-                    timestamp = now,
-                    replicaId = self.clientReplicaId
+                    path = parentPath, entry = entry, ref = prev,
+                    timestamp = now, replicaId = self.clientReplicaId
                 )
-                // Snapshot was already mutated in-place above; do NOT
-                // re-merge locally — the original port double-applied
-                // every local op which racked up redundant listener fires
-                // and could re-shuffle RGA `after` chains.
                 self.pending.add(op)
                 prev = id
             }
@@ -504,12 +498,11 @@ class CRDT(
             if (ids.isEmpty()) return null
             val idToRemove = ids.last()
             val arr = self.getContainerAt(parentPath) as? LDArray
-            val returnValue = arr?.entries?.remove(idToRemove)?.value
+
+            val returnValue = arr?.entries?.get(idToRemove)?.value
             val op = CRDTOperation.ArrayRemove(
-                ref = idToRemove,
-                path = parentPath,
-                timestamp = System.currentTimeMillis(),
-                replicaId = self.clientReplicaId
+                ref = idToRemove, path = parentPath,
+                timestamp = System.currentTimeMillis(), replicaId = self.clientReplicaId
             )
             self.pending.add(op)
             self.scheduleFlush()
@@ -521,12 +514,10 @@ class CRDT(
             if (index !in ids.indices) return null
             val id = ids[index]
             val arr = self.getContainerAt(parentPath) as? LDArray
-            val returnValue = arr?.entries?.remove(id)?.value
+            val returnValue = arr?.entries?.get(id)?.value
             val op = CRDTOperation.ArrayRemove(
-                ref = id,
-                path = parentPath,
-                timestamp = System.currentTimeMillis(),
-                replicaId = self.clientReplicaId
+                ref = id, path = parentPath,
+                timestamp = System.currentTimeMillis(), replicaId = self.clientReplicaId
             )
             self.pending.add(op)
             self.scheduleFlush()
@@ -634,13 +625,10 @@ class CRDT(
             val ids = self.visibleIdsFor(parentPath)
             val toRemove = ids.drop(index).take(removeCount)
             toRemove.forEach { id ->
-                (self.getContainerAt(parentPath) as? LDArray)?.entries?.remove(id)
                 self.pending.add(
                     CRDTOperation.ArrayRemove(
-                        ref = id,
-                        path = parentPath,
-                        timestamp = System.currentTimeMillis(),
-                        replicaId = self.clientReplicaId
+                        ref = id, path = parentPath,
+                        timestamp = System.currentTimeMillis(), replicaId = self.clientReplicaId
                     )
                 )
             }
@@ -661,20 +649,26 @@ class CRDT(
                         type = determineType(converted),
                         value = converted,
                         meta = LDMeta(
-                            updatedAt = now, version = 1,
-                            replicaId = self.clientReplicaId, after = prev
+                            updatedAt = now,
+                            version = 1,
+                            replicaId = self.clientReplicaId,
+                            after = prev
                         )
                     )
-                    (self.getContainerAt(parentPath) as? LDArray)?.entries?.set(id, entry)
                     val op = if (prev != null) {
                         CRDTOperation.ArrayPush(
-                            path = parentPath, entry = entry, ref = prev,
-                            timestamp = now, replicaId = self.clientReplicaId
+                            path = parentPath,
+                            entry = entry,
+                            ref = prev,
+                            timestamp = now,
+                            replicaId = self.clientReplicaId
                         )
                     } else {
                         CRDTOperation.ArrayUnshift(
-                            path = parentPath, entry = entry,
-                            timestamp = now, replicaId = self.clientReplicaId
+                            path = parentPath,
+                            entry = entry,
+                            timestamp = now,
+                            replicaId = self.clientReplicaId
                         )
                     }
                     self.pending.add(op)
