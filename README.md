@@ -1,4 +1,4 @@
-# ART ADK (ARealtimeTech Development Kit)
+# ART - A Realtime Tech communication
 
 A powerful, coroutine-based Android library for building real-time, highly collaborative, and secure
 applications. **ART ADK** provides a robust set of tools for WebSocket management, Conflict-free
@@ -108,7 +108,7 @@ sub.fetchPresence(callback = { users ->
     Log.d(
         "Presence", "Presence received ${users.size}"
     )
-  }
+}
 )
 ```
 
@@ -159,13 +159,13 @@ adk.intercept(name) { payload, resolve, reject ->
 
 Full documentation is available at [docs.arealtimetech.com/docs/adk]().
 
-| Topic | Link |
-|---|---|
-| Overview | [ADK Overview](https://docs.arealtimetech.com/docs/adk/) |
-| Installation | [Flutter Installation](https://docs.arealtimetech.com/docs/adk/kotlin/installation) |
-| Publish & Subscribe | [Pub/Sub Docs](https://docs.arealtimetech.com/docs/adk/kotlin/pub-sub) |
-| Connection Management | [Connection Docs](https://docs.arealtimetech.com/docs/adk/kotlin/connection-management) |
-| User Presence | [Presence Docs](https://docs.arealtimetech.com/docs/adk/kotlin/user-presence) |
-| Encrypted Channels | [Encryption Docs](https://docs.arealtimetech.com/docs/adk/kotlin/encrypted-channel) |
+| Topic                  | Link                                                                                       |
+|------------------------|--------------------------------------------------------------------------------------------|
+| Overview               | [ADK Overview](https://docs.arealtimetech.com/docs/adk/)                                   |
+| Installation           | [Installation](https://docs.arealtimetech.com/docs/adk/kotlin/installation)                |
+| Publish & Subscribe    | [Pub/Sub Docs](https://docs.arealtimetech.com/docs/adk/kotlin/pub-sub)                     |
+| Connection Management  | [Connection Docs](https://docs.arealtimetech.com/docs/adk/kotlin/connection-management)    |
+| User Presence          | [Presence Docs](https://docs.arealtimetech.com/docs/adk/kotlin/user-presence)              |
+| Encrypted Channels     | [Encryption Docs](https://docs.arealtimetech.com/docs/adk/kotlin/encrypted-channel)        |
 | Shared Object Channels | [Shared Object Docs](https://docs.arealtimetech.com/docs/adk/kotlin/shared-object-channel) |
-| Interceptors | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/kotlin/intercept-channel) |
+| Interceptors           | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/kotlin/intercept-channel)       |
