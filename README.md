@@ -37,6 +37,16 @@ implementation(project(":art_adk_library"))
 
 ### 1. Initialization
 
+Add this to your root build.gradle:
+
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+```
+
 Configure the core ADK client with your environment credentials:
 
 ```kotlin
