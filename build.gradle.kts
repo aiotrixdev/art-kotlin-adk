@@ -1,6 +1,21 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
+    id("maven-publish")
+}
+
+publishing {
+    publications {
+        register<MavenPublication>("release") {
+            groupId = "com.github.aiotrixdev"
+            artifactId = "art-kotlin-adk"
+            version = "1.0.0"
+
+            afterEvaluate {
+                from(components["release"])
+            }
+        }
+    }
 }
 
 android {
@@ -38,6 +53,11 @@ android {
             "-opt-in=kotlin.RequiresOptIn"
         )
     }
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
 }
 
 dependencies {
@@ -65,4 +85,8 @@ dependencies {
 
     /* JSON */
     implementation("com.google.code.gson:gson:2.11.0")
+
+    implementation("com.github.jitpack:android-example:1.0.1")
+    implementation("com.github.aiotrixdev:art-kotlin-adk:1.0.0")
+
 }
