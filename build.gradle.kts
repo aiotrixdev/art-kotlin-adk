@@ -16,7 +16,6 @@ afterEvaluate {
         }
     }
 }
-
 android {
     namespace = "com.example.artlibrary"
     compileSdk = 35
@@ -84,4 +83,5 @@ dependencies {
 
     /* JSON */
     implementation("com.google.code.gson:gson:2.11.0")
+
 }
