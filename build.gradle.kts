@@ -7,8 +7,9 @@ plugins {
 afterEvaluate {
     publishing {
         publications {
-            register<MavenPublication>("release") {
+            create<MavenPublication>("release") {
                 from(components["release"])
+
                 groupId = "com.github.aiotrixdev"
                 artifactId = "art-kotlin-adk"
                 version = "1.0.0"
@@ -16,6 +17,7 @@ afterEvaluate {
         }
     }
 }
+
 android {
     namespace = "com.example.artlibrary"
     compileSdk = 35
