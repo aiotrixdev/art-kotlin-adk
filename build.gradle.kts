@@ -4,15 +4,14 @@ plugins {
     id("maven-publish")
 }
 
-publishing {
-    publications {
-        register<MavenPublication>("release") {
-            groupId = "com.github.aiotrixdev"
-            artifactId = "art-kotlin-adk"
-            version = "1.0.0"
-
-            afterEvaluate {
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
                 from(components["release"])
+                groupId    = "com.github.aiotrixdev"
+                artifactId = "art-kotlin-adk"
+                version    = "1.0.0"
             }
         }
     }
@@ -85,4 +84,5 @@ dependencies {
 
     /* JSON */
     implementation("com.google.code.gson:gson:2.11.0")
+
 }
