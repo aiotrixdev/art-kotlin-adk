@@ -25,19 +25,6 @@ messaging using Libsodium and AI orchestration integration..
 
 ## Installation
 
-Add this to your app's `settings.gradle.kts`:
-
-```kotlin
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories {
-        google()
-        mavenCentral()
-        maven { url = uri("https://jitpack.io") }
-    }
-}
-```
-
 Then add the dependency in your app module:
 
 ```kotlin
@@ -174,7 +161,8 @@ adk.intercept(name) { payload, resolve, reject ->
 
 ### Documentation
 
-Full documentation is available at [docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk).
+Full documentation is available
+at [docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk).
 
 | Topic                  | Link                                                                                       |
 |------------------------|--------------------------------------------------------------------------------------------|
