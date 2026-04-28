@@ -25,6 +25,19 @@ messaging using Libsodium and AI orchestration integration..
 
 ## Installation
 
+Add this to your app's `settings.gradle.kts`:
+
+```kotlin
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+```
+
 Then add the dependency in your app module:
 
 ```kotlin
@@ -32,6 +45,8 @@ dependencies {
     implementation("com.github.aiotrixdev:art-kotlin-adk:TAG")
 }
 ```
+
+Replace `TAG` with the GitHub release tag you publish through JitPack, for example `1.0.0`.
 
 ## Quick Start
 
