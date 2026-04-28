@@ -4,6 +4,8 @@ plugins {
     id("maven-publish")
 }
 
+val publishVersion = System.getenv("VERSION") ?: "1.0.0"
+
 afterEvaluate {
     publishing {
         publications {
@@ -11,7 +13,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.aiotrixdev"
                 artifactId = "art-kotlin-adk"
-                version = "1.0.0"
+                version = publishVersion
             }
         }
     }
