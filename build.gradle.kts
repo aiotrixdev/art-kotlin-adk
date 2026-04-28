@@ -7,7 +7,7 @@ plugins {
 afterEvaluate {
     publishing {
         publications {
-            create<MavenPublication>("release") {
+            register<MavenPublication>("release") {
                 from(components["release"])
 
                 groupId = "com.github.aiotrixdev"
