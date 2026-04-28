@@ -33,8 +33,6 @@ dependencies {
 }
 ```
 
-Replace `TAG` with the GitHub release tag you publish through JitPack, for example `1.0.0`.
-
 ## Quick Start
 
 ### 1. Initialization
