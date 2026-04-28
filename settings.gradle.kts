@@ -20,6 +20,4 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "art_adk"
-include(":app")
-include(":art_adk_library")
+rootProject.name = "art-adk-library"

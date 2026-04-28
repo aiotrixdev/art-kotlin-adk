@@ -25,39 +25,46 @@ messaging using Libsodium and AI orchestration integration..
 
 ## Installation
 
-### Add Dependency
-
-In your app-level `build.gradle.kts`:
-
-```kotlin
-implementation(project(":art_adk_library"))
-```
-
-## Quick Start
-
-### 1. Initialization
-
-Add this to your root build.gradle:
+Add this to your app's `settings.gradle.kts`:
 
 ```kotlin
 dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        google()
+        mavenCentral()
         maven { url = uri("https://jitpack.io") }
     }
 }
 ```
 
+Then add the dependency in your app module:
+
+```kotlin
+dependencies {
+    implementation("com.github.aiotrixdev:art-kotlin-adk:TAG")
+}
+```
+
+Replace `TAG` with the GitHub release tag you publish through JitPack, for example `1.0.0`.
+
+## Quick Start
+
+### 1. Initialization
+
 Configure the core ADK client with your environment credentials:
 
 ```kotlin
-import com.example.art_adk_library.websockets.Adk
-import com.example.art_adk_library.types.AdkConfig
-import com.example.art_adk_library.types.AuthCredentials
+import com.example.artlibrary.types.AdkConfig
+import com.example.artlibrary.types.CredentialStore
+import com.example.artlibrary.websockets.Adk
 
 val adkConfig = AdkConfig(
     uri = "your_server_webSocket.com",
+    authToken = "YOUR_AUTH_TOKEN",
+    root = "",
     getCredentials = {
-        AuthCredentials(
+        CredentialStore(
             environment = "YOUR_ENVIRONMENT",
             projectKey = "YOUR_PROJECT_KEY",
             orgTitle = "YOUR_ORG",
@@ -167,7 +174,7 @@ adk.intercept(name) { payload, resolve, reject ->
 
 ### Documentation
 
-Full documentation is available at [docs.arealtimetech.com/docs/adk]().
+Full documentation is available at [docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk).
 
 | Topic                  | Link                                                                                       |
 |------------------------|--------------------------------------------------------------------------------------------|
