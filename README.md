@@ -161,8 +161,7 @@ adk.intercept(name) { payload, resolve, reject ->
 
 ### Documentation
 
-Full documentation is available
-at [docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk).
+Full documentation is available at [docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk).
 
 | Topic                  | Link                                                                                       |
 |------------------------|--------------------------------------------------------------------------------------------|
