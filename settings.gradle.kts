@@ -22,4 +22,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "art_adk"
 include(":app")
-include(":library")
+include(":art_adk_library")
