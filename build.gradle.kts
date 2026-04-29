@@ -1,17 +1,20 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
     id("maven-publish")
 }
 
+val publishVersion = System.getenv("VERSION") ?: "1.0.0"
+
 afterEvaluate {
     publishing {
         publications {
             create<MavenPublication>("release") {
                 from(components["release"])
-                groupId    = "com.github.aiotrixdev"
+                groupId = "com.github.aiotrixdev"
                 artifactId = "art-kotlin-adk"
-                version    = "1.0.0"
+                version = publishVersion
             }
         }
     }
@@ -84,5 +87,4 @@ dependencies {
 
     /* JSON */
     implementation("com.google.code.gson:gson:2.11.0")
-
 }
