@@ -12,7 +12,7 @@ afterEvaluate {
                 from components.release
                 groupId = "com.github.aiotrixdev"
                 artifactId = "art-kotlin-adk"
-                version = 1.0.0
+                version = "1.0.0"
             }
         }
     }
