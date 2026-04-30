@@ -8,8 +8,8 @@ plugins {
 afterEvaluate {
     publishing {
         publications {
-            release(MavenPublication){
-                from components.release
+            create<MavenPublication>("release") {
+                from(components["release"])
                 groupId = "com.github.aiotrixdev"
                 artifactId = "art-kotlin-adk"
                 version = "1.0.0"
