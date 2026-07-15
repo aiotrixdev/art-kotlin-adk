@@ -46,7 +46,8 @@ suspend fun subscribeToChannel(
         snapshot = data["snapshot"],
         presenceUsers = (data["presenceUsers"] as? List<*>)
             ?.map { it.toString() } ?: emptyList(),
-        subscriptionID = data["subscriptionID"]?.toString()
+        subscriptionID = data["subscriptionID"]?.toString(),
+        orchestratorEnabled = rawData["IsInterceptorEnabled"] as? Boolean ?: false
     )
 }
 

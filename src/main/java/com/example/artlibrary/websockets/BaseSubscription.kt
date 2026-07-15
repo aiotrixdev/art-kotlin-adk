@@ -17,9 +17,10 @@ open class BaseSubscription(
     protected val websocketHandler: IWebsocketHandler,
     process: String = "subscribe",
 ) : EventEmitter() {
-
     val messageBuffer =
         mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
+    protected val threadBuffers =
+        mutableMapOf<String, MutableMap<String, MutableList<MutableMap<String, Any?>>>>()
 
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -32,7 +33,6 @@ open class BaseSubscription(
     // FIX: Store both the deferred and the timer Job together, matching JS's { resolve, reject, timer }
     private val pendingAcks =
         ConcurrentHashMap<String, Pair<CompletableDeferred<Any?>, Job>>()
-
     var presenceUsers =
         channelConfig.presenceUsers.toMutableList()
 
@@ -185,12 +185,9 @@ open class BaseSubscription(
             }
         }
 
-        try {
-            val result = push("art_presence", emptyMap<String, Any>())
-            Log.d("FetchPresence", "Push result: $result")
-        } catch (e: Exception) {
-            Log.e("FetchPresence", "Error pushing art_presence: ${e.message}", e)
-            throw e
+        scope.launch {
+            runCatching { push("art_presence", emptyMap<String, Any>()) }
+                .onFailure { Log.e("FetchPresence", "Error pushing art_presence: ${it.message}", it) }
         }
 
         return suspend {
@@ -207,26 +204,24 @@ open class BaseSubscription(
         val refId = payload["ref_id"] as? String ?: return
         val entry = pendingAcks.remove(refId) ?: return
         entry.second.cancel()          // cancel the timeout timer
-        entry.first.complete(refId)    // resolve the deferred
+        entry.first.complete(refId)    // match JS behavior: resolve with the generated ref id
     }
 
     /* ---------------- Acknowledge ---------------- */
 
     fun acknowledge(request: MutableMap<String, Any?>, res: String) {
-
-        if (channelConfig.channelType !in listOf("targeted", "secure"))
+        if (channelConfig.channelName in listOf("art_config", "art_secure", "art_presence")) {
             return
+        }
 
         val channel = request["channel"] as? String ?: return
-        if (channel in listOf("art_config", "art_secure", "art_presence"))
-            return
 
         val response = mapOf(
             "channel" to channel,
-            "namespace" to request["namespace"],
             "id" to request["id"],
             "ref_id" to request["ref_id"],
             "from" to request["from"],
+            "to_user_id" to request["to_user_id"],
             "to_username" to request["to_username"],
             "to" to request["to"],
             "return_flag" to res,
@@ -250,6 +245,7 @@ open class BaseSubscription(
 
         val connection = websocketHandler.getConnection()
         val to = options?.to ?: emptyList<String>()
+        val threadId = options?.threadId
         var messageStr = gson.toJson(data)
         // ---- Targeted / Secure validation ----
         if ((channelConfig.channelType == "secure"
@@ -306,16 +302,7 @@ open class BaseSubscription(
                 ackDeferred.completeExceptionally(Exception("ACK timeout"))
             }
 
-            if (channelConfig.channelType == "targeted"
-                || channelConfig.channelName == "secure"
-            ) {
-                // FIX: Store both deferred and timer so handleMessageAcks can cancel the timer
-                pendingAcks[refId!!] = Pair(ackDeferred, timer)
-            } else {
-                // Non-targeted: resolve immediately and cancel the timer
-                timer.cancel()
-                ackDeferred.complete(refId)
-            }
+            pendingAcks[refId] = Pair(ackDeferred, timer)
 
         } else {
             ackDeferred.complete(null)
@@ -324,20 +311,16 @@ open class BaseSubscription(
         val message = mapOf(
             "from" to (connection?.connectionId ?: ""),
             "to" to to,
-            "channel" to buildString {
-                append(channelConfig.channelName)
-                channelConfig.channelNamespace.takeIf { it.isNotBlank() }?.let {
-                    append(":$it")
-                }
-            },
+            "channel" to channelConfig.channelName,
             "event" to event,
             "content" to messageStr,
-            "ref_id" to refId
+            "ref_id" to refId,
+            "thread_id" to threadId
         )
 
         websocketHandler.sendMessage(message.toJson())
 
-        return ackDeferred
+        return ackDeferred.await()
     }
 
     open fun handleMessage(event: String, payload: Any) {}

@@ -1,10 +1,12 @@
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
+import com.example.artlibrary.agentic.Agent
 import com.example.artlibrary.auth.Auth
 import com.example.artlibrary.config.Constant
 import com.example.artlibrary.crypto.CryptoBox
 import com.example.artlibrary.types.AdkConfig
+import com.example.artlibrary.types.CredentialStore
 import com.example.artlibrary.types.AuthenticationConfig
 import com.example.artlibrary.types.CallApiProps
 import com.example.artlibrary.types.ConnectionDetail
@@ -25,12 +27,13 @@ class Adk(config: AdkConfig? = null) {
     private var reconnectAttempts = 0
     private val maxReconnectAttempts = 5
     private var reconnectDelay = 3000L
-    private val maxDelay = 5000L
+    private val maxDelay = 30000L
     protected var myKeyPair: KeyPairType? = null
     private var isPaused = false
     protected var adkConfig: AdkConfig? = null
     var isConnectable = false
     private var isLimitExceeded = false
+    private var credentialData: CredentialStore? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
@@ -60,6 +63,9 @@ class Adk(config: AdkConfig? = null) {
 
 
     suspend fun connect() {
+        if (adkConfig?.autoLoadCredsFromJSON == true) {
+            credentialData = loadConfig().toCredentialStore()
+        }
         isConnectable = true
         initiateSocketConnection()
     }
@@ -115,16 +121,37 @@ class Adk(config: AdkConfig? = null) {
     private suspend fun initiateSocketConnection() {
         val config = adkConfig
             ?: throw IllegalStateException("AdkConfig is null. Initialize SDK properly.")
-        val authConfig = AuthenticationConfig(
-            environment = "",
-            projectKey = "",
-            orgTitle = "",
-            clientID = "",
-            clientSecret = "",
-            accessToken = null
-        ).apply {
-            this.config = config
-            this.getCredentials = config.getCredentials
+        credentialData?.let { seeded ->
+            val authConfig = AuthenticationConfig(
+                environment = seeded.environment,
+                projectKey = seeded.projectKey,
+                orgTitle = seeded.orgTitle,
+                clientID = seeded.clientID,
+                clientSecret = seeded.clientSecret,
+                config = config,
+                accessToken = seeded.accessToken,
+                getCredentials = config.getCredentials
+            )
+            this.socket.initiateSocket(authConfig)
+            return
+        }
+        val authConfig = if (config.getCredentials == null) {
+            loadConfig().apply {
+                this.config = config
+                this.getCredentials = null
+            }
+        } else {
+            AuthenticationConfig(
+                environment = "",
+                projectKey = "",
+                orgTitle = "",
+                clientID = "",
+                clientSecret = "",
+                accessToken = null
+            ).apply {
+                this.config = config
+                this.getCredentials = config.getCredentials
+            }
         }
 
         config.getCredentials?.invoke()?.let { creds ->
@@ -219,6 +246,10 @@ class Adk(config: AdkConfig? = null) {
         return this
     }
 
+    fun setCredentials(credentials: CredentialStore) {
+        credentialData = credentials
+    }
+
 
     /**
      * Subscribe to a specific channel via Socket.
@@ -239,6 +270,14 @@ class Adk(config: AdkConfig? = null) {
         fn: (payload: Any?, resolve: (Any?) -> Unit, reject: (Any?) -> Unit) -> Unit
     ): Interception {
         return socket.intercept(interceptor, fn)
+    }
+
+    fun agent(agentId: String): Agent {
+        return Agent(agentId, socket)
+    }
+
+    fun orchestrator(orchestratorId: String): Orchestrator {
+        return Orchestrator(orchestratorId, socket)
     }
 
     /**
@@ -302,6 +341,18 @@ class Adk(config: AdkConfig? = null) {
             environment = credentials.getString("Environment"),
             orgTitle = credentials.getString("Org-Title"),
             projectKey = credentials.getString("ProjectKey")
+        )
+    }
+
+    private fun AuthenticationConfig.toCredentialStore(): CredentialStore {
+        return CredentialStore(
+            environment = environment,
+            projectKey = projectKey,
+            orgTitle = orgTitle,
+            clientID = clientID,
+            clientSecret = clientSecret,
+            config = config,
+            accessToken = accessToken
         )
     }
 
