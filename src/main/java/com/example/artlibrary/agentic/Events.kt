@@ -1,3 +1,5 @@
+package com.example.artlibrary.agentic
+
 /**
  * Typed envelope for events emitted on the `agent_com_<agentId>` channel.
  *

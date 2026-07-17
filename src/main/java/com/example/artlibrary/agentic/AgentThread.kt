@@ -1,4 +1,5 @@
-import com.example.artlibrary.agentic.Agent
+package com.example.artlibrary.agentic
+
 import kotlinx.coroutines.*
 
 
@@ -7,9 +8,9 @@ typealias HumanInputHandler = suspend (req: HumanInputRequest, run: Run) -> Unit
 
 data class RunDeps(val reply_id: String? = null)
 
-class AgentThread(val agent: Agent) {
-    val threadId: String = generateThreadId()
-    private var masterListenerJob: Job? = null
+class AgentThread(val agent: Agent, threadId: String? = null) {
+    val threadId: String = threadId ?: generateThreadId()
+    private var masterListenerJob: Deferred<Unit>? = null
     private val userListeners: MutableList<UserListener> = mutableListOf()
     private val feedbackRequestHandlers: MutableList<HumanInputHandler> = mutableListOf()
     private var activeRun: Run? = null
@@ -23,15 +24,29 @@ class AgentThread(val agent: Agent) {
     /**
      * Install the single subscription-level listener that fans out to all
      * user `listen` callbacks and the active `Run`. Idempotent — first caller
-     * wins; subsequent calls return the same job.
+     * wins; subsequent calls await the same job.
+     *
+     * Uses `async`/`await` rather than `launch`/`join`: `join` does not rethrow,
+     * so a failed subscribe would escape the scope uncaught and kill the process
+     * instead of surfacing to the caller. On failure the job is cleared so a
+     * later `listen`/`run` can retry the subscription.
      */
     private suspend fun ensureMasterListener() {
-        if (masterListenerJob != null) return
-        masterListenerJob = scope.launch {
+        masterListenerJob?.let { return it.await() }
+
+        val job = scope.async {
             val sub = agent.getSubscription()
             sub.listen { raw -> dispatch(raw) }
+            sub.attachThreadListener(threadId) { raw -> dispatch(raw) }
         }
-        masterListenerJob!!.join()
+        masterListenerJob = job
+
+        try {
+            job.await()
+        } catch (e: Exception) {
+            if (masterListenerJob === job) masterListenerJob = null
+            throw e
+        }
     }
 
     fun dispatch(raw: Any?) {

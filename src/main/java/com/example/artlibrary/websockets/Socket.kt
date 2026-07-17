@@ -1,3 +1,5 @@
+package com.example.artlibrary.websockets
+
 import android.app.usage.UsageEvents
 import android.os.Build
 import android.util.Log

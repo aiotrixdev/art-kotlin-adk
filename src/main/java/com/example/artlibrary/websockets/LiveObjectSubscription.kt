@@ -1,6 +1,5 @@
 package com.example.artlibrary.websockets
 
-import BaseSubscription
 import com.example.artlibrary.config.AdkLog
 import com.example.artlibrary.config.Events
 import com.example.artlibrary.config.ReservedChannels

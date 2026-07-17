@@ -1,3 +1,6 @@
+package com.example.artlibrary.agentic
+
+import com.example.artlibrary.websockets.Socket
 import com.example.artlibrary.websockets.Subscription
 import kotlinx.coroutines.*
 
@@ -24,6 +27,12 @@ abstract class BaseWorkflow(protected val socket: Socket) {
     suspend fun getSubscription(): Subscription {
         subscription?.let { return it }
         if (subscribeJob == null) connect()
-        return subscribeJob!!.await()
+        val job = subscribeJob!!
+        return try {
+            job.await()
+        } catch (e: Exception) {
+            if (subscribeJob === job) subscribeJob = null
+            throw e
+        }
     }
 }

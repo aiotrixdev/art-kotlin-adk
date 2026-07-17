@@ -1,3 +1,5 @@
+package com.example.artlibrary.websockets
+
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi

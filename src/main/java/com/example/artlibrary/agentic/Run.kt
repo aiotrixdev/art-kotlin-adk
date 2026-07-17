@@ -1,3 +1,5 @@
+package com.example.artlibrary.agentic
+
 import android.util.Log
 import kotlinx.coroutines.*
 
@@ -185,7 +187,7 @@ class Run(private val thread: AgentThread) {
         if (closed) return
         clearHumanInputTimer()
         closed = true
-        doneDeferred.completeExceptionally(IllegalStateException(reason))
+        doneDeferred.completeExceptionally(RunLifecycleException(reason))
     }
 
     /** Whether the run has terminated. */
@@ -195,6 +197,17 @@ class Run(private val thread: AgentThread) {
 /**
  * Wraps an `AgentError` as a throwable exception so it can be surfaced
  * through `CompletableDeferred.completeExceptionally`.
+ *
+ * [agentError] is exposed so callers can branch on `code` rather than
+ * parse the message.
  */
-class AgentErrorException(agentError: AgentError) :
+class AgentErrorException(val agentError: AgentError) :
     Exception("Agent error [${agentError.code}]: ${agentError.message}")
+
+/**
+ * Raised by [Run.done] when a run is force-closed before a terminal event —
+ * e.g. superseded by a newer run on the same thread. Distinct from
+ * [AgentErrorException] so callers can ignore lifecycle churn while still
+ * surfacing real agent failures.
+ */
+class RunLifecycleException(message: String) : Exception(message)

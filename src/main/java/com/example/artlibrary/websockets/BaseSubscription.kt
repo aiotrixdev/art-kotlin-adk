@@ -1,3 +1,5 @@
+package com.example.artlibrary.websockets
+
 import android.util.Log
 import com.example.artlibrary.types.ChannelConfig
 import com.example.artlibrary.types.IWebsocketHandler

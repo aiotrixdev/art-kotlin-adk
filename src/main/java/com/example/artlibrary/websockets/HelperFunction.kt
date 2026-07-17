@@ -33,6 +33,9 @@ suspend fun subscribeToChannel(
     val data = dataRaw.mapKeys { it.key.toString() }
 
     if (data["status"] == "not-OK") {
+        // Diagnostic: the server returns only a one-line `error`, so log the whole
+        // payload — it is the only way to see which config it actually resolved.
+        AdkLog.e(TAG, "'$subscriptionChannelName' rejected for channel '$channel' -> $data")
         throw IllegalStateException(data["error"]?.toString() ?: "Unknown error")
     }
 

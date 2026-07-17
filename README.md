@@ -491,6 +491,8 @@ at [docs.arealtimetech.com/docs/adk](https://docs.arealtimetech.com/docs/adk).
 | Encrypted Channels     | [Encryption Docs](https://docs.arealtimetech.com/docs/adk/kotlin/encrypted-channel)        |
 | Shared Object Channels | [Shared Object Docs](https://docs.arealtimetech.com/docs/adk/kotlin/shared-object-channel) |
 | Interceptors           | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/kotlin/intercept-channel)       |
+| Agent                  | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/kotlin/agent)                   |
+| Orchestrator           | [Interceptor Docs](https://docs.arealtimetech.com/docs/adk/kotlin/orchestrator)            |
 
 ## Licence
 

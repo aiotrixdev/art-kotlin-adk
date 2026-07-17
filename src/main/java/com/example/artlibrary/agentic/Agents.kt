@@ -1,8 +1,6 @@
 package com.example.artlibrary.agentic
 
-import AgentThread
-import BaseWorkflow
-import Socket
+import com.example.artlibrary.websockets.Socket
 
 class Agent(
     val agentId: String,
@@ -16,5 +14,5 @@ class Agent(
         return this
     }
 
-    fun thread(): AgentThread = AgentThread(this)
+    fun thread(threadId: String? = null): AgentThread = AgentThread(this, threadId)
 }

@@ -1,7 +1,6 @@
 package com.example.artlibrary.agentic
 
-import BaseWorkflow
-import Socket
+import com.example.artlibrary.websockets.Socket
 
 class Orchestrator(
     val orchestratorId: String,

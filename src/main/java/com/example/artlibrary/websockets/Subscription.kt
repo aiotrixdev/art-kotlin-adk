@@ -1,6 +1,5 @@
 package com.example.artlibrary.websockets
 
-import BaseSubscription
 import com.example.artlibrary.agentic.OrchestratorThread
 import com.example.artlibrary.config.ChannelTypes
 import com.example.artlibrary.config.Events
