@@ -45,8 +45,9 @@ data class ConnectionDetail(
 )
 
 data class PushConfig(
-    val to: List<String>,
-    val instanceId: String
+    val to: List<String> = emptyList(),
+    val instanceId: String? = null,
+    val threadId: String? = null
 )
 
 data class AdkSecureUserInterface(

@@ -3,148 +3,139 @@ package com.example.artlibrary.websockets
 import com.example.artlibrary.config.AdkLog
 import com.example.artlibrary.config.ReturnFlags
 import com.example.artlibrary.types.IWebsocketHandler
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 private const val TAG = "ArtInterception"
 
-/**
- * Server-side interceptor binding. Each instance owns a coroutine scope used
- * to run the user's interceptor callback off the WebSocket reader thread.
- */
 class Interception(
     private val interceptor: String,
     private val fn: (payload: Any?, resolve: (Any?) -> Unit, reject: (Any?) -> Unit) -> Unit,
-    private val websocketHandler: IWebsocketHandler,
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val websocketHandler: IWebsocketHandler
 ) {
 
     private var interceptorData: Any? = null
-    private var reconnectJob: Job? = null
 
     suspend fun validateInterception() {
         try {
             interceptorData = getInterceptorConfig(interceptor, websocketHandler)
         } catch (e: Exception) {
-            AdkLog.e(TAG, "Failed for interceptor: '$interceptor'", e)
             throw e
         }
     }
 
-    fun reconnect() {
-        if (reconnectJob?.isActive == true) return
-        reconnectJob = scope.launch {
-            try {
-                validateInterception()
-            } finally {
-                reconnectJob = null
-            }
-        }
-    }
-
-    /** Cancels the internal scope. Call when the SDK is being torn down. */
-    fun release() {
-        scope.cancel()
+    suspend fun reconnect() {
+        AdkLog.d(TAG, "reconnecting interceptor $interceptor")
+        validateInterception()
     }
 
     private fun createResponse(
-        config: Map<String, Any>,
-        id: String,
-        refId: String,
-        channel: String,
-        namespace: String,
-        event: String,
-        pipelineId: String,
-        interceptorName: String,
-        attemptId: String,
+        config: Map<String, Any?>,
+        id: Any?,
+        refId: Any?,
+        channel: Any?,
+        namespace: Any?,
+        event: Any?,
+        pipelineId: Any?,
+        interceptorName: Any?,
+        attemptId: Any?,
         type: String,
-        content: Any
-    ): Map<String, Any> = config.toMutableMap().apply {
-        this["channel"] = channel
-        this["namespace"] = namespace
-        this["event"] = event
-        this["id"] = id
-        this["ref_id"] = refId
-        this["return_flag"] = type
-        this["pipeline_id"] = pipelineId
-        this["interceptor_name"] = interceptorName
-        this["attempt_id"] = attemptId
-        this["content"] = JSONObject.wrap(content) ?: content
+        content: Any?
+    ): Map<String, Any?> {
+        val response = config.toMutableMap()
+        response["channel"] = channel
+        response["namespace"] = namespace
+        response["event"] = event
+        response["id"] = id
+        response["ref_id"] = refId
+        response["return_flag"] = type
+        response["pipeline_id"] = pipelineId
+        response["interceptor_name"] = interceptorName
+        response["attempt_id"] = attemptId
+        // matches JS: content: JSON.stringify(content)
+        response["content"] = jsonStringify(content)
+        return response
     }
 
-    private fun execute(request: MutableMap<String, Any>) {
+    private fun execute(request: MutableMap<String, Any?>) {
         acknowledge(request)
 
-        val id = request["id"] as String
-        val refId = request["ref_id"] as String
-        val channel = request["channel"] as String
-        val namespace = request["namespace"] as String
-        val event = request["event"] as String
-        val pipelineId = request["pipeline_id"] as String
-        val interceptorName = request["interceptor_name"] as String
-        val attemptId = request["attempt_id"] as String
+        val id = request["id"]
+        val channel = request["channel"]
+        val namespace = request["namespace"]
         val from = request["from"]
-            ?: throw IllegalStateException("Interceptor request missing 'from'")
         val to = request["to"]
-            ?: throw IllegalStateException("Interceptor request missing 'to'")
+        val event = request["event"]
+        val interceptorName = request["interceptor_name"]
+        val pipelineId = request["pipeline_id"]
+        val attemptId = request["attempt_id"]
+        val refId = request["ref_id"]
         val rawData = request["data"]
 
-        val config: MutableMap<String, Any> = mutableMapOf(
+        val threadId = request["thread_id"]
+        val nodeId = request["node_id"]
+        val agentNodeId = request["agent_node_id"]
+        val agentId = request["agent_id"]
+        val environmentId = request["environment_id"]
+        val toUsername = request["to_username"]
+        val configurationId = request["configuration_id"]
+        val rootWorkflowId = request["root_workflow_id"]
+
+        val config: Map<String, Any?> = mapOf(
             "channel" to channel,
             "namespace" to namespace,
             "event" to event,
             "interceptor_name" to interceptorName,
             "from" to from,
-            "to" to to
+            "to" to to,
+            "to_username" to toUsername,
+            "thread_id" to threadId,
+            "node_id" to nodeId,
+            "agent_node_id" to agentNodeId,
+            "agent_id" to agentId,
+            "environment_id" to environmentId,
+            "configuration_id" to configurationId,
+            "root_workflow_id" to rootWorkflowId
         )
 
-        // FIX: previously used `let@` which caused early-return *from let* and
-        // silently dropped non-Map payloads. We now resolve normally and
-        // unwrap nested envelopes when present.
         val resolve: (Any?) -> Unit = { resolved ->
-            val data: Any = when {
-                resolved is Map<*, *> &&
-                        (resolved.containsKey("attempt_id") || resolved.containsKey("pipeline_id")) ->
-                    (resolved["data"] as? Map<*, *>) ?: emptyMap<String, Any>()
-                resolved is Map<*, *> -> resolved
-                resolved == null -> emptyMap<String, Any>()
-                else -> mapOf("value" to resolved)
+            // JS: if (data === null || typeof data !== 'object') -> log error, return
+            if (resolved == null || resolved !is Map<*, *>) {
+                AdkLog.e(TAG, "Invalid data: Expected a JSON object or array of objects. $resolved")
+            } else {
+                var data: Any? = resolved
+                val map = resolved as Map<*, *>
+                if (map.containsKey("attempt_id") || map.containsKey("pipeline_id")) {
+                    data = map["data"] ?: emptyMap<String, Any?>()
+                }
+
+                val response = createResponse(
+                    config, id, refId, channel, namespace, event,
+                    pipelineId, interceptorName, attemptId, "resolve", data
+                )
+                websocketHandler.sendMessage(jsonStringify(response))
             }
-            val response = createResponse(
-                config, id, refId, channel, namespace, event,
-                pipelineId, interceptorName, attemptId, "resolve", data
-            )
-            websocketHandler.sendMessage(JSONObject(response).toString())
         }
 
         val reject: (Any?) -> Unit = { error ->
+            // JS: if (typeof error !== 'string') throw new Error('Error must be a string');
+            if (error !is String) {
+                throw IllegalArgumentException("Error must be a string")
+            }
             val errorResponse = mapOf(
-                "rawData" to (rawData ?: JSONObject.NULL),
-                "error" to (error ?: "unknown error")
+                "rawData" to rawData,
+                "error" to error
             )
             val response = createResponse(
                 config, id, refId, channel, namespace, event,
                 pipelineId, interceptorName, attemptId, "reject", errorResponse
             )
-            websocketHandler.sendMessage(JSONObject(response).toString())
+            websocketHandler.sendMessage(jsonStringify(response))
         }
 
-        scope.launch {
-            try {
-                fn(request, resolve, reject)
-            } catch (e: Exception) {
-                AdkLog.e(TAG, "Interceptor function threw", e)
-                reject(e.message ?: "interceptor failed")
-            }
-        }
+        fn(request, resolve, reject)
     }
 
-    private fun acknowledge(request: MutableMap<String, Any>) {
+    private fun acknowledge(request: MutableMap<String, Any?>) {
         val response = mapOf(
             "channel" to request["channel"],
             "namespace" to request["namespace"],
@@ -152,25 +143,46 @@ class Interception(
             "ref_id" to request["ref_id"],
             "from" to request["from"],
             "to" to request["to"],
+            "to_username" to request["to_username"],
             "return_flag" to ReturnFlags.INTERCEPTOR_ACK,
             "pipeline_id" to request["pipeline_id"],
             "interceptor_name" to request["interceptor_name"],
             "attempt_id" to request["attempt_id"],
-            "content" to JSONObject.wrap(request["data"])
+            "thread_id" to request["thread_id"],
+            "node_id" to request["node_id"],
+            "agent_node_id" to request["agent_node_id"],
+            "agent_id" to request["agent_id"],
+            "environment_id" to request["environment_id"],
+            "configuration_id" to request["configuration_id"],
+            "root_workflow_id" to request["root_workflow_id"],
+            "content" to jsonStringify(request["data"])
         )
-        websocketHandler.sendMessage(JSONObject(response).toString())
+
+        websocketHandler.sendMessage(jsonStringify(response))
     }
 
     @Suppress("UNCHECKED_CAST")
     fun handleMessage(channel: String, data: MutableMap<String, Any?>) {
         try {
             val rawData = data["data"]
-            if (rawData is String && rawData.isNotEmpty()) {
-                data["data"] = JSONObject(rawData)
-            }
-            execute(data as MutableMap<String, Any>)
+            data["data"] = JSONObject(rawData as String)
+            execute(data)
         } catch (e: Exception) {
-            AdkLog.e(TAG, "Error handling message", e)
+            throw e
+        }
+    }
+
+    /**
+     * Equivalent of JS `JSON.stringify(value)` for our Map/List/primitive
+     * representation, using org.json under the hood.
+     */
+    private fun jsonStringify(value: Any?): String {
+        return when (value) {
+            null -> "null"
+            is Map<*, *> -> JSONObject(value).toString()
+            is List<*> -> org.json.JSONArray(value).toString()
+            is String -> JSONObject.quote(value)
+            else -> JSONObject.wrap(value)?.toString() ?: value.toString()
         }
     }
 }
