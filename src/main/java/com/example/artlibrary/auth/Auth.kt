@@ -2,14 +2,11 @@ package com.example.artlibrary.auth
 
 import android.os.Build
 import androidx.annotation.RequiresApi
-import com.example.artlibrary.config.AdkLog
 import com.example.artlibrary.config.Constant
 import com.example.artlibrary.config.HttpClientProvider
 import com.example.artlibrary.types.AuthData
 import com.example.artlibrary.types.AuthenticationConfig
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,107 +15,60 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.Base64
 
-/**
- * Singleton holder for the SDK's authentication state.
- *
- * Responsibilities:
- *  - Caches the current [AuthData] (access + refresh tokens) and serves it
- *    to other SDK components.
- *  - Drives the token-acquisition / refresh flow.
- *  - Coordinates concurrent callers via a [Mutex] so only one network round
- *    trip is in flight at any time, even when several coroutines call
- *    [authenticate] simultaneously.
- *
- * Lifecycle: call [destroy] when the SDK is being torn down to wipe the
- * cached credentials and tokens from memory. The next call to [getInstance]
- * will then require a fresh [AuthenticationConfig] again.
- */
 class Auth private constructor(
-    private var credentials: AuthenticationConfig
+    private val credentials: AuthenticationConfig
 ) {
 
     private var authData: AuthData = AuthData(accessToken = "", refreshToken = "")
-    private val mutex = Mutex()
     private val httpClient = HttpClientProvider.shared
 
     companion object {
-        private const val TAG = "ArtAuth"
-
         @Volatile
         private var instance: Auth? = null
 
-        /**
-         * Returns the singleton, creating it on first call.
-         *
-         * Subsequent calls may pass `null` and will return the existing
-         * instance. The first call MUST supply a non-null [credentials]
-         * value or [IllegalStateException] is thrown.
-         */
         fun getInstance(credentials: AuthenticationConfig? = null): Auth {
             val existing = instance
             if (existing != null) return existing
             return synchronized(this) {
                 instance ?: run {
                     val seed = credentials
-                        ?: throw IllegalStateException(
-                            "Auth.getInstance(): credentials are required on first call"
-                        )
+                        ?: throw IllegalStateException("Forbidden")
                     Auth(seed).also { instance = it }
                 }
             }
         }
-
-        /** Tears down the singleton; subsequent [getInstance] calls require new credentials. */
-        fun destroy() {
-            synchronized(this) {
-                instance?.wipe()
-                instance = null
-            }
-        }
     }
 
-    /**
-     * Returns a valid (non-expired) [AuthData], obtaining or refreshing
-     * tokens as required. Safe to call concurrently.
-     */
     @RequiresApi(Build.VERSION_CODES.O)
-    suspend fun authenticate(forceAuth: Boolean = false): AuthData = mutex.withLock {
+    suspend fun authenticate(forceAuth: Boolean = false): AuthData {
         if (!forceAuth &&
             authData.accessToken.isNotEmpty() &&
             !isTokenExpired(authData.accessToken)
         ) {
-            return@withLock authData
+            return authData
         }
 
-        // Allow the host application to refresh credentials lazily.
-        credentials.getCredentials?.invoke()?.let { fresh ->
-            credentials = credentials.copy(
-                accessToken = fresh.accessToken,
-                clientID = fresh.clientID,
-                clientSecret = fresh.clientSecret,
-                orgTitle = fresh.orgTitle,
-                environment = fresh.environment,
-                projectKey = fresh.projectKey
-            )
+        val c = credentials
+
+        if (c.orgTitle.isEmpty() || c.environment.isEmpty() || c.projectKey.isEmpty()) {
+            throw IllegalArgumentException("OrgTitle, Environment, and ProjectKey are required for authentication.")
         }
 
-        require(credentials.orgTitle.isNotEmpty()) { "OrgTitle is required for authentication" }
-        require(credentials.environment.isNotEmpty()) { "Environment is required for authentication" }
-        require(credentials.projectKey.isNotEmpty()) { "ProjectKey is required for authentication" }
-
-        // If a refresh token exists and is still valid, prefer the refresh path.
-        if (authData.refreshToken.isNotEmpty() &&
-            !isTokenExpired(authData.refreshToken)
-        ) {
-            return@withLock refreshAuthToken()
+        if (!getRefreshTokenExpiryInfo(authData.refreshToken).expired) {
+            return refreshAuthToken()
         }
 
-        return@withLock generateAuthToken()
+        return generateAuthToken()
     }
 
-    /** Acquires a brand new token pair from the auth server. */
-    suspend fun generateAuthToken(): AuthData = withContext(Dispatchers.IO) {
+    private suspend fun generateAuthToken(): AuthData = withContext(Dispatchers.IO) {
         val c = credentials
+
+        if (c.accessToken.isNullOrEmpty()) {
+            if (c.clientID.isEmpty() || c.clientSecret.isEmpty()) {
+                throw IllegalArgumentException("ClientID and ClientSecret are required when AccessToken is not present.")
+            }
+        }
 
         val headers = mutableMapOf<String, String>().apply {
             put("Client-Id", c.clientID)
@@ -126,7 +76,11 @@ class Auth private constructor(
             put("X-Org", c.orgTitle)
             put("Environment", c.environment)
             put("ProjectKey", c.projectKey)
-            c.accessToken?.let { put("T-pass", it) }
+
+            if (!c.accessToken.isNullOrEmpty()) {
+                put("T-pass", c.accessToken!!)
+            }
+
             c.config?.authToken?.let { put("X-pass", it) }
         }
 
@@ -139,7 +93,7 @@ class Auth private constructor(
         httpClient.newCall(request).execute().use { response ->
             val body = response.body?.string()
             if (!response.isSuccessful) {
-                val message = parseErrorMessage(body) ?: "HTTP ${response.code}"
+                val message = parseErrorMessage(body) ?: "HTTP ${response.code} ${response.message}"
                 throw IllegalStateException(message)
             }
             authData = parseTokenResponse(body)
@@ -147,28 +101,39 @@ class Auth private constructor(
         }
     }
 
-    /** Exchanges the current refresh token for a fresh access token. */
     private suspend fun refreshAuthToken(): AuthData = withContext(Dispatchers.IO) {
         val c = credentials
-        if (c.accessToken.isNullOrEmpty() && c.clientID.isEmpty()) {
-            throw IllegalArgumentException("ClientID is required when AccessToken is not present")
+
+        if (c.accessToken.isNullOrEmpty()) {
+            if (c.clientID.isEmpty()) {
+                throw IllegalArgumentException("ClientID is required when AccessToken is not present.")
+            }
         }
 
-        val headers = mapOf(
-            "Client-Id" to c.clientID,
-            "X-Org" to c.orgTitle,
-            "Environment" to c.environment,
-            "ProjectKey" to c.projectKey
-        )
+        val headers = mutableMapOf<String, String>().apply {
+            put("X-Org", c.orgTitle)
+            put("Environment", c.environment)
+            put("ProjectKey", c.projectKey)
 
-        val body = JSONObject()
+            if (c.clientID.isNotEmpty()) {
+                put("Client-Id", c.clientID)
+            }
+
+            if (!c.accessToken.isNullOrEmpty()) {
+                put("T-pass", c.accessToken!!)
+            }
+
+            c.config?.authToken?.let { put("X-pass", it) }
+        }
+
+        val requestBody = JSONObject()
             .put("refresh_token", authData.refreshToken)
             .toString()
             .toRequestBody("application/json".toMediaType())
 
         val request = Request.Builder()
             .url("${Constant.BASE_URL}/auth/token/refresh")
-            .post(body)
+            .post(requestBody)
             .headers(headers.toHeaders())
             .build()
 
@@ -176,13 +141,16 @@ class Auth private constructor(
             val responseBody = response.body?.string()
             if (!response.isSuccessful) {
                 val json = runCatching { JSONObject(responseBody.orEmpty()) }.getOrNull()
+
                 if (response.code == 500 &&
                     json?.optString("error") == "Failed to get WebSocket backend"
                 ) {
+                    // keep existing AccessToken + RefreshToken
                     throw IllegalStateException(
                         json.optString("error", "Internal server error")
                     )
                 }
+
                 val errorMessage = json?.optString("message")
                     .takeUnless { it.isNullOrEmpty() }
                     ?: "HTTP ${response.code} ${response.message}"
@@ -196,16 +164,6 @@ class Auth private constructor(
     fun getAuthData(): AuthData = authData
 
     fun getCredentials(): AuthenticationConfig = credentials
-
-    /** Wipes cached tokens and credentials in-place. */
-    private fun wipe() {
-        authData = AuthData(accessToken = "", refreshToken = "")
-        credentials = credentials.copy(
-            clientID = "",
-            clientSecret = "",
-            accessToken = null
-        )
-    }
 
     // ---------------- helpers ----------------
 
@@ -227,8 +185,7 @@ class Auth private constructor(
 
     @RequiresApi(Build.VERSION_CODES.O)
     private fun decodeJwtPayload(token: String): JSONObject {
-        val payload = token.split(".").getOrNull(1)
-            ?: throw IllegalArgumentException("Malformed JWT")
+        val payload = token.split(".").getOrElse(1) { "" }
         val padded = payload
             .replace('-', '+')
             .replace('_', '/')
@@ -237,23 +194,44 @@ class Auth private constructor(
         return JSONObject(String(decoded, Charsets.UTF_8))
     }
 
-    /**
-     * Returns `true` when the JWT's `exp` is in the past (with a 100s skew
-     * buffer) or the token cannot be decoded.
-     *
-     * NOTE: this only inspects the unsigned payload. It is a hint to avoid
-     * useless network round-trips, NOT a security check — the server remains
-     * the source of truth.
-     */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun isTokenExpired(token: String): Boolean {
-        if (token.isEmpty()) return true
         return try {
-            val exp = decodeJwtPayload(token).getLong("exp")
-            exp < (System.currentTimeMillis() / 1000) - 100
+            val exp = decodeJwtPayload(token).optLong("exp", -1L)
+            if (exp == -1L) {
+                true
+            } else {
+                exp < (System.currentTimeMillis() / 1000) - 100
+            }
         } catch (e: Exception) {
-            AdkLog.w(TAG, "Failed to decode JWT for expiry check", e)
             true
         }
     }
+
+    /**
+     * Mirrors the JS implementation: the "refresh token" here is treated as
+     * a raw numeric expiry value in its second dot-segment, NOT a JWT.
+     */
+    private fun getRefreshTokenExpiryInfo(token: String): RefreshTokenExpiryInfo {
+        val parts = token.split(".")
+        val expStr = parts.getOrElse(1) { "" }
+        val exp = expStr.toLongOrNull()
+
+        if (exp == null || exp == 0L) {
+            return RefreshTokenExpiryInfo(expired = true, exp = null, remaining = 0)
+        }
+
+        val now = System.currentTimeMillis() / 1000
+        return RefreshTokenExpiryInfo(
+            expired = now >= exp,
+            exp = exp,
+            remaining = exp - now
+        )
+    }
+
+    private data class RefreshTokenExpiryInfo(
+        val expired: Boolean,
+        val exp: Long?,
+        val remaining: Long
+    )
 }

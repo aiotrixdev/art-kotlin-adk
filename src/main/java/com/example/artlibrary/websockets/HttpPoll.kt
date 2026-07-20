@@ -1,3 +1,5 @@
+package com.example.artlibrary.websockets
+
 import android.net.Uri
 import com.google.gson.Gson
 import kotlinx.coroutines.*
