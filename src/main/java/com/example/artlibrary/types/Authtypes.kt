@@ -2,8 +2,9 @@ package com.example.artlibrary.types
 
 data class AdkConfig(
     val uri: String,
-    val authToken: String,
-    val root: String,
+    val authToken: String? = null,
+    val root: String? = null,
+    val autoLoadCredsFromJSON: Boolean = false,
     val getCredentials: (() -> CredentialStore)? = null
 )
 

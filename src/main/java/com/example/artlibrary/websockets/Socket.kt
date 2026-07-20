@@ -1,3 +1,5 @@
+package com.example.artlibrary.websockets
+
 import android.app.usage.UsageEvents
 import android.os.Build
 import android.util.Log
@@ -17,6 +19,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -46,6 +49,7 @@ class Socket private constructor(
     private var connection: ConnectionDetail? = null
     var isConnectionActive = false
     private var heartbeatInterval: Timer? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val pendingSendMessges = mutableListOf<String>()
     val secureCallbacks = mutableMapOf<String, (Any?) -> Unit>()
@@ -66,26 +70,28 @@ class Socket private constructor(
             encrypt: suspend (String, String) -> String, decrypt: suspend (String, String) -> String
         ): Socket {
             var socketRef: Socket? = null
-            val lp = LongPollClient(opts = LongPollOptions(endpoint = Constant.LPOLL,
-                getAuthHeaders = suspend {
-                    val auth = Auth.getInstance()
-                    auth.authenticate()
-                    val authData = auth.getAuthData()
-                    val creds = auth.getCredentials()
-                    mapOf(
-                        "Authorization" to "Bearer ${authData.accessToken}",
-                        "X-Org" to creds.orgTitle,
-                        "Environment" to creds.environment,
-                        "ProjectKey" to creds.projectKey
-                    )
-                }, onMessages = { msgs ->
-                    CoroutineScope(Dispatchers.IO).launch {
-                        socketRef?.processIncomingMessages(msgs)
-                    }
-                },
-                onError = { err ->
-                    Log.e("LP error:", "$err")
-                })
+            val lp = LongPollClient(
+                opts = LongPollOptions(
+                    endpoint = Constant.LPOLL,
+                    getAuthHeaders = suspend {
+                        val auth = Auth.getInstance()
+                        auth.authenticate()
+                        val authData = auth.getAuthData()
+                        val creds = auth.getCredentials()
+                        mapOf(
+                            "Authorization" to "Bearer ${authData.accessToken}",
+                            "X-Org" to creds.orgTitle,
+                            "Environment" to creds.environment,
+                            "ProjectKey" to creds.projectKey
+                        )
+                    }, onMessages = { msgs ->
+                        CoroutineScope(Dispatchers.IO).launch {
+                            socketRef?.processIncomingMessages(msgs)
+                        }
+                    },
+                    onError = { err ->
+                        Log.e("LP error:", "$err")
+                    })
             )
             val socket = Socket(encrypt, decrypt, lp)
             socketRef = socket
@@ -99,8 +105,15 @@ class Socket private constructor(
         if (this.websocket != null && this.isConnectionActive) return
 
         this.credentials = credentials
-        connectWebSocket()
-        // 3. Attempt SSE (Server-Sent Events) Connection
+        try {
+            connectWebSocket()
+            this.pullSource = "socket"
+            this.pushSource = "socket"
+            return
+        } catch (wsErr: Exception) {
+            Log.w("Socket", "WebSocket failed, falling back to SSE", wsErr)
+        }
+
         try {
             connectSSE()
             this.pullSource = "sse"
@@ -122,7 +135,15 @@ class Socket private constructor(
         isConnecting = true
 
         val auth = Auth.getInstance(credentials)
-        val authData = auth.authenticate()
+        val authData = try {
+            auth.authenticate(forceAuth = true)
+        } catch (err: Exception) {
+            isConnecting = false
+            isConnectionActive = false
+            throw err
+        }
+
+        safeClose()
 
         suspendCancellableCoroutine<Unit> { cont ->
 
@@ -162,12 +183,20 @@ class Socket private constructor(
 
                 override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                     Log.e("WS_FAIL", t.message ?: "error", t)
+                    isConnecting = false
+                    isConnectionActive = false
+                    websocket = null
                     if (cont.isActive) cont.resumeWith(Result.failure(t))
                 }
 
                 override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                    val shouldEmitClose = connection != null || isConnectionActive
                     isConnectionActive = false
                     isConnecting = false
+                    websocket = null
+                    if (shouldEmitClose) {
+                        emit("close", mapOf("code" to code, "reason" to reason))
+                    }
                 }
             })
         }
@@ -211,18 +240,8 @@ class Socket private constructor(
         val authData = try {
             auth.authenticate()
         } catch (err: Exception) {
-            println("Authentication failed: $err")
-            emit("close", mapOf("type" to "error"))
-            return
+            throw err
         }
-
-        // Build params
-        val params = mapOf(
-            "Org-Title" to credentials.orgTitle,
-            "token" to authData.accessToken,
-            "environment" to credentials.environment,
-            "project-key" to credentials.projectKey
-        )
 
         val httpUrl = Constant.SSE_URL.toHttpUrl().newBuilder()
 
@@ -298,7 +317,6 @@ class Socket private constructor(
             projectKey = credentials.projectKey
         )
 
-
         emit("connection", connection)
 
         isConnectionActive = true
@@ -306,13 +324,14 @@ class Socket private constructor(
         startHeartbeat()
 
         if (autoReconnect) {
+            scope.launch {
+                subscriptions.forEach { (_, subscriptionInstance) ->
+                    subscriptionInstance.reconnect()
+                }
 
-            subscriptions.forEach { (_, subscriptionInstance) ->
-                subscriptionInstance.reconnect()
-            }
-
-            interceptors.forEach { (_, interceptorInstance) ->
-                interceptorInstance.reconnect()
+                interceptors.forEach { (_, interceptorInstance) ->
+                    interceptorInstance.reconnect()
+                }
             }
         }
     }
@@ -415,7 +434,8 @@ class Socket private constructor(
                 channelType = "default",
                 presenceUsers = emptyList(),
                 snapshot = null,
-                subscriptionID = ""
+                subscriptionID = "",
+                orchestratorEnabled = false
             )
         }
         return try {
@@ -545,9 +565,6 @@ class Socket private constructor(
 
                     callback.invoke(response)
                     secureCallbacks.remove(key)
-
-                } else {
-                    Log.e("SECURE_ERROR", "No callback found for refId: $refId")
                 }
 
                 return
@@ -588,13 +605,7 @@ class Socket private constructor(
             } else {
 
                 //Subscription handling
-                var subscriptionKey = channel
-
-                if (!namespace.isNullOrEmpty()) {
-                    subscriptionKey += ":$namespace"
-                }
-
-                val subscription = subscriptions[subscriptionKey]
+                val subscription = subscriptions[channel]
 
                 if (subscription != null) {
 
@@ -611,11 +622,10 @@ class Socket private constructor(
 
                     Log.w(
                         "Socket",
-                        "No subscription found for channel: $subscriptionKey, adding to buffer"
+                        "No subscription found for channel: $channel, adding to buffer"
                     )
 
-                    val arr =
-                        pendingIncomingMessages.getOrPut(subscriptionKey) { mutableListOf() }
+                    val arr = pendingIncomingMessages.getOrPut(channel) { mutableListOf() }
 
                     arr.add(IncomingMessage(event ?: "", msg))
                 }
