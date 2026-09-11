@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
+    id("maven-publish")
 }
 
 android {
@@ -21,6 +22,27 @@ android {
         jvmTarget = "17"
     }
 
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+                // JitPack serves multi-module artifacts under com.github.<user>.<repo>.
+                // Sharing the core's group lets art_notifier's transitive dependency on
+                // it resolve for consumers. artifactId + version identify THIS package.
+                groupId = "com.github.aiotrixdev.art-kotlin-adk"
+                artifactId = "art-notifier"
+                version = "v1.0.0"
+            }
+        }
+    }
 }
 
 dependencies {

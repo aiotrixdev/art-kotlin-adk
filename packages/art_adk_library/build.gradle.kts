@@ -10,9 +10,10 @@ afterEvaluate {
         publications {
             create<MavenPublication>("release") {
                 from(components["release"])
-                groupId = "com.github.aiotrixdev"
+                // Multi-module: JitPack namespaces artifacts as com.github.<user>.<repo>.
+                groupId = "com.github.aiotrixdev.art-kotlin-adk"
                 artifactId = "art-kotlin-adk"
-                version = "1.0.2"
+                version = "1.0.3"
             }
         }
     }
