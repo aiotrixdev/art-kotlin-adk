@@ -20,9 +20,4 @@ dependencyResolutionManagement {
     }
 }
 
-
-rootProject.name = "art-adk-workspace"
-include(":art_adk_library")
-project(":art_adk_library").projectDir = file("packages/art_adk_library")
-include(":art_notifier")
-project(":art_notifier").projectDir = file("packages/art_notifier")
+rootProject.name = "art-adk-library"
