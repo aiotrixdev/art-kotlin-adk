@@ -1,22 +1,8 @@
-// Top-level build file where you can add configuration options common to all sub-projects/modules.
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
     id("maven-publish")
-}
-
-afterEvaluate {
-    publishing {
-        publications {
-            create<MavenPublication>("release") {
-                from(components["release"])
-                // Multi-module: JitPack namespaces artifacts as com.github.<user>.<repo>.
-                groupId = "com.github.aiotrixdev.art-kotlin-adk"
-                artifactId = "art-kotlin-adk"
-                version = "1.0.3"
-            }
-        }
-    }
+    id("signing")
 }
 
 android {
@@ -47,17 +33,69 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
-        // Treat all warnings as warnings (not errors). Once detekt/ktlint
-        // is added, raise this to '-Werror'.
         freeCompilerArgs = freeCompilerArgs + listOf(
             "-Xjvm-default=all",
             "-opt-in=kotlin.RequiresOptIn"
         )
     }
+    // Maven Central requires a sources jar AND a javadoc jar.
     publishing {
         singleVariant("release") {
             withSourcesJar()
+            withJavadocJar()
         }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+                groupId = "io.github.aiotrixdev"
+                artifactId = "art-kotlin-adk"
+                version = "1.0.3"
+                // Maven Central requires complete POM metadata.
+                pom {
+                    name.set("ART Kotlin ADK")
+                    description.set("Realtime communication SDK for Android — WebSocket, CRDT sync, end-to-end crypto, and AI agent/orchestrator integration.")
+                    url.set("https://github.com/aiotrixdev/art-kotlin-adk")
+                    licenses {
+                        license {
+                            name.set("The Apache License, Version 2.0")
+                            url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                        }
+                    }
+                    developers {
+                        developer {
+                            id.set("aiotrixdev")
+                            name.set("Aiotrixdev")
+                        }
+                    }
+                    scm {
+                        url.set("https://github.com/aiotrixdev/art-kotlin-adk")
+                        connection.set("scm:git:git://github.com/aiotrixdev/art-kotlin-adk.git")
+                        developerConnection.set("scm:git:ssh://git@github.com/aiotrixdev/art-kotlin-adk.git")
+                    }
+                }
+            }
+        }
+        // Writes the full signed layout to <root>/build/central-bundle/ for a
+        // manual bundle upload on central.sonatype.com.
+        repositories {
+            maven {
+                name = "centralBundle"
+                url = uri("${rootProject.layout.buildDirectory.get().asFile}/central-bundle")
+            }
+        }
+    }
+    // Maven Central requires a GPG signature (.asc) on every file.
+    // useGpgCmd() delegates to your gpg CLI (signs ed25519 natively, passphrase
+    // via gpg-agent) instead of the bundled BouncyCastle, which fails on modern
+    // GnuPG-exported keys with "checksum mismatch".
+    signing {
+        useGpgCmd()
+        sign(publishing.publications["release"])
     }
 }
 
@@ -86,9 +124,4 @@ dependencies {
 
     /* JSON */
     implementation("com.google.code.gson:gson:2.11.0")
-
-    // NOTE: Firebase belongs ONLY in the :app module (device push lives in the
-    // example app, not this SDK library). Do not add firebase-* here — newer
-    // firebase-analytics pulls play-services-measurement compiled with Kotlin
-    // 2.x, which this library's Kotlin 1.9.22 compiler cannot read.
 }

@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
     id("maven-publish")
+    id("signing")
 }
 
 android {
@@ -21,10 +22,11 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-
+    // Maven Central requires a sources jar AND a javadoc jar.
     publishing {
         singleVariant("release") {
             withSourcesJar()
+            withJavadocJar()
         }
     }
 }
@@ -34,14 +36,50 @@ afterEvaluate {
         publications {
             create<MavenPublication>("release") {
                 from(components["release"])
-                // JitPack serves multi-module artifacts under com.github.<user>.<repo>.
-                // Sharing the core's group lets art_notifier's transitive dependency on
-                // it resolve for consumers. artifactId + version identify THIS package.
-                groupId = "com.github.aiotrixdev.art-kotlin-adk"
+                groupId = "io.github.aiotrixdev"
                 artifactId = "art-notifier"
-                version = "v1.0.0"
+                version = "1.0.0"
+                // Maven Central requires complete POM metadata.
+                pom {
+                    name.set("ART Notifier")
+                    description.set("Notifications plugin for the ART Kotlin ADK — live (WebSocket) and REST notifications, plus FCM push device registration.")
+                    url.set("https://github.com/aiotrixdev/art-kotlin-adk")
+                    licenses {
+                        license {
+                            name.set("The Apache License, Version 2.0")
+                            url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                        }
+                    }
+                    developers {
+                        developer {
+                            id.set("aiotrixdev")
+                            name.set("Aiotrixdev")
+                        }
+                    }
+                    scm {
+                        url.set("https://github.com/aiotrixdev/art-kotlin-adk")
+                        connection.set("scm:git:git://github.com/aiotrixdev/art-kotlin-adk.git")
+                        developerConnection.set("scm:git:ssh://git@github.com/aiotrixdev/art-kotlin-adk.git")
+                    }
+                }
             }
         }
+        // Writes the full signed layout to <root>/build/central-bundle/ for a
+        // manual bundle upload on central.sonatype.com.
+        repositories {
+            maven {
+                name = "centralBundle"
+                url = uri("${rootProject.layout.buildDirectory.get().asFile}/central-bundle")
+            }
+        }
+    }
+    // Maven Central requires a GPG signature (.asc) on every file.
+    // useGpgCmd() delegates to your gpg CLI (signs ed25519 natively, passphrase
+    // via gpg-agent) instead of the bundled BouncyCastle, which fails on modern
+    // GnuPG-exported keys with "checksum mismatch".
+    signing {
+        useGpgCmd()
+        sign(publishing.publications["release"])
     }
 }
 
