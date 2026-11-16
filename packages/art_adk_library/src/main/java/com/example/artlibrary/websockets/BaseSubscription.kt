@@ -2,16 +2,14 @@ package com.example.artlibrary.websockets
 
 import android.util.Log
 import com.example.artlibrary.types.ChannelConfig
+import com.example.artlibrary.types.ConnectionError
 import com.example.artlibrary.types.IWebsocketHandler
 import com.example.artlibrary.types.PushConfig
-import com.example.artlibrary.websockets.EventEmitter
 import com.example.artlibrary.websockets.subscribeToChannel
 import com.example.artlibrary.websockets.unsubscribeFromChannel
 import com.google.gson.Gson
 import kotlinx.coroutines.*
-import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
-
 
 open class BaseSubscription(
     val connectionID: String,
@@ -19,6 +17,10 @@ open class BaseSubscription(
     protected val websocketHandler: IWebsocketHandler,
     process: String = "subscribe",
 ) : EventEmitter() {
+
+    var isSubscribed = false
+    var isListening = false
+
     val messageBuffer =
         mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
     protected val threadBuffers =
@@ -26,16 +28,11 @@ open class BaseSubscription(
 
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    var isSubscribed = false
-    var isListening = false
-
-    private val ACK_TIMEOUT = 50_000L
-    private var messageCount = 0
-
-    // FIX: Store both the deferred and the timer Job together, matching JS's { resolve, reject, timer }
     private val pendingAcks =
         ConcurrentHashMap<String, Pair<CompletableDeferred<Any?>, Job>>()
-    var presenceUsers =
+    protected val ACK_TIMEOUT = 50_000L
+    protected var messageCount = 0
+    protected var presenceUsers: MutableList<String> =
         channelConfig.presenceUsers.toMutableList()
 
     init {
@@ -45,87 +42,34 @@ open class BaseSubscription(
         }
     }
 
-    open suspend fun subscribe() {
-        if (channelConfig.channelName in listOf("art_config", "art_secure","art_notifications"))
-            return
-
-        isSubscribed = true
-
-        try {
-            val updatedConfig = subscribeToChannel(
-                channelConfig.channelName,
-                "subscribe", this.websocketHandler
-            )
-            channelConfig = updatedConfig
-            Log.d("subscribeToChannel", "")
-        } catch (error: Exception) {
-            Log.e("BaseSubscription", "Subscribe error: ${error.message}")
-            isSubscribed = false
-        }
+    fun onConnectionFailure(listener: (error: ConnectionError) -> Unit) {
+        websocketHandler.onConnectionFailure(listener)
     }
 
-    open suspend fun unsubscribe() {
-        val subId = channelConfig.subscriptionID ?: return
-
-        try {
-            val success = unsubscribeFromChannel(
-                channelConfig.channelName,
-                subId,
-                "subscribe", this.websocketHandler
-            )
-            if (success) {
-                websocketHandler.removeSubscription(channelConfig.channelName)
-            } else {
-                Log.e(
-                    "BaseSubscription",
-                    "Failed to unsubscribe from channel ${channelConfig.channelName}"
-                )
-            }
-        } catch (error: Exception) {
-            Log.e("BaseSubscription", "Unsubscribe error: ${error.message}")
-        }
+    fun offConnectionFailure(listener: (error: ConnectionError) -> Unit) {
+        websocketHandler.offConnectionFailure(listener)
     }
-
-    open fun reconnect() {
-        if (channelConfig.channelName !in listOf("art_config", "art_secure")) {
-            if (isListening) {
-                scope.launch { validateSubscription("presence") }
-            }
-            scope.launch { subscribe() }
-        }
-    }
-
-    /* ---------------- Validate ---------------- */
 
     open suspend fun validateSubscription(process: String) {
-        if (channelConfig.channelName in listOf("art_config", "art_secure"))
-            return
-
-        var channelName = channelConfig.channelName
-        channelConfig.channelNamespace.takeIf { it.isNotBlank() }?.let {
-            channelName += ":$it"
-        }
-
         try {
-            val updatedConfig = subscribeToChannel(
-                channelName,
-                process,
-                this.websocketHandler
-            )
-            channelConfig = updatedConfig
-            if (process == "presence") {
-                isListening = true
+            if (channelConfig.channelName in listOf("art_config", "art_secure")) return
+            var channelName = channelConfig.channelName
+            if (channelConfig.channelNamespace.isNotBlank()) {
+                channelName += ":" + channelConfig.channelNamespace
+            }
+            try {
+                val config = subscribeToChannel(channelName, process, websocketHandler)
+                channelConfig = config
+                if (process == "presence") {
+                    isListening = true
+                }
+            } catch (error: Exception) {
+                Log.e("BaseSubscription", "$error")
             }
         } catch (error: Exception) {
-            Log.e("BaseSubscription", "Validate subscription error: ${error.message}")
+            Log.e("BaseSubscription", "$error")
         }
     }
-
-    /* ---------------- Presence ---------------- */
-
-    data class PresenceConfig(
-        val unique: Boolean = true
-    )
 
     /**
      * Check for presence on the channel.
@@ -134,96 +78,67 @@ open class BaseSubscription(
      */
     suspend fun fetchPresence(
         callback: (List<String>) -> Unit,
-        options: PresenceConfig = PresenceConfig()
-    ): suspend () -> Unit {
-
-        // Return cached presence if available
-        var previousPresenceData = presenceUsers
+        options: PresenceConfig = PresenceConfig(unique = true)
+    ): PresenceSubscription {
+        var previousPresenceData: List<String> = presenceUsers
         if (previousPresenceData.isNotEmpty()) {
-            Log.d("FetchPresence", "Calling callback with cached presence: $previousPresenceData")
             callback(previousPresenceData)
         }
-
-        Log.d("FetchPresence", "Validating subscription for presence")
         validateSubscription("presence")
-
         if (!isListening) {
-            Log.e("FetchPresence", "Not listening for presence after validation")
             throw IllegalStateException("Not subscribed for presence")
         }
-
         on("art_presence") { payload ->
-            Log.d("FetchPresence", "Received art_presence payload: $payload")
-            if (payload is Map<*, *>) {
-                val usernames = (payload["usernames"] as? List<*>)
-                    ?.filterIsInstance<String>()
-                    ?.toMutableList()
-                    ?: run {
-                        Log.w("FetchPresence", "No usernames in payload")
-                        return@on
-                    }
-
-                Log.d("FetchPresence", "Received usernames: $usernames")
-                presenceUsers = usernames
-
-                // Parse "username:connectionId" format and extract usernames
-                val userResponse = mutableListOf<String>()
-                usernames.forEach { user ->
-                    if (options.unique) {
-                        val parts = user.split(":")
-                        if (parts.isNotEmpty()) {
-                            val userName = parts[0]
-                            // Filter unique usernames
-                            if (!userResponse.contains(userName)) {
-                                userResponse.add(userName)
-                            }
+            val map = payload as? Map<*, *>
+            val error = map?.get("error")
+            if (error == null) {
+                val usernames = (map?.get("usernames") as? List<*>)
+                    ?.filterIsInstance<String>() ?: emptyList()
+                previousPresenceData = usernames
+                presenceUsers = usernames.toMutableList()
+                // ['b:69a1332c...', 'a:69a132f8...', 'a:69a13318...']
+                var userResponse = mutableListOf<String>()
+                if (options.unique) {
+                    usernames.forEach { user ->
+                        val userName = user.split(":").getOrElse(0) { user }
+                        if (userResponse.indexOf(userName) < 0) {
+                            userResponse.add(userName)
                         }
-                    } else {
-                        // When unique is false, return full user strings
-                        userResponse.add(user)
                     }
+                } else {
+                    userResponse = usernames.toMutableList()
                 }
                 callback(userResponse)
             }
         }
-
-        scope.launch {
-            runCatching { push("art_presence", emptyMap<String, Any>()) }
-                .onFailure { Log.e("FetchPresence", "Error pushing art_presence: ${it.message}", it) }
-        }
-
-        return suspend {
-            unsubscribe()
-        }
+        scope.launch { runCatching { push("art_presence", emptyMap<String, Any?>()) } }
+        return PresenceSubscription(unsubscribe = {
+            val success = unsubscribeFromChannel(
+                channelConfig.channelName,
+                channelConfig.subscriptionID ?: "",
+                "presence",
+                websocketHandler
+            )
+            if (!success) {
+                Log.e("BaseSubscription", "Failed to unsubscribe from channel ${channelConfig.channelName}")
+            }
+        })
     }
-
-
-    /* ---------------- ACK Handling ---------------- */
-
-    fun handleMessageAcks(event: String, returnFlag: String, payload: MutableMap<String, Any?>) {
-        if (returnFlag != "SA") return
-
-        val refId = payload["ref_id"] as? String ?: return
-        val entry = pendingAcks.remove(refId) ?: return
-        entry.second.cancel()          // cancel the timeout timer
-        entry.first.complete(refId)    // match JS behavior: resolve with the generated ref id
-    }
-
-    /* ---------------- Acknowledge ---------------- */
 
     fun acknowledge(request: MutableMap<String, Any?>, res: String) {
-        if (channelConfig.channelName in listOf("art_config", "art_secure", "art_presence")) {
+        if (channelConfig.channelType != "targeted" && channelConfig.channelType != "secure") {
             return
         }
-
-        val channel = request["channel"] as? String ?: return
-
+        val channel = request["channel"] as? String
+        if (channel in listOf("art_config", "art_secure", "art_presence")) {
+            return
+        }
         val response = mapOf(
             "channel" to channel,
+            "namespace" to request["namespace"],
             "id" to request["id"],
             "ref_id" to request["ref_id"],
             "from" to request["from"],
-            "to_user_id" to request["to_user_id"],
             "to_username" to request["to_username"],
             "to" to request["to"],
             "return_flag" to res,
@@ -231,98 +146,147 @@ open class BaseSubscription(
             "interceptor_name" to request["interceptor_name"],
             "attempt_id" to request["attempt_id"]
         )
-
-        websocketHandler.sendMessage(response.toJson())
+        websocketHandler.sendMessage(Gson().toJson(response))
     }
 
-    /* ---------------- Push ---------------- */
+    fun handleMessageAcks(event: String, returnFlag: String, data: MutableMap<String, Any?>) {
+        if (returnFlag == "SA") {
+            val refId = data["ref_id"] as? String ?: return
+            val entry = pendingAcks[refId] ?: return
+            entry.second.cancel()
+            entry.first.complete(refId)
+            pendingAcks.remove(refId)
+        }
+    }
 
-    open suspend fun push(
-        event: String,
-        data: Any,
-        options: PushConfig? = null
-    ): Any? {
+    open suspend fun subscribe() {
+        if (channelConfig.channelName in listOf("art_config", "art_secure", "art_notifications")) {
+            return
+        }
+        isSubscribed = true
+        try {
+            channelConfig = subscribeToChannel(channelConfig.channelName, "subscribe", websocketHandler)
+        } catch (error: Exception) {
+            Log.e("BaseSubscription", "$error")
+            isSubscribed = false
+            throw error
+        }
+    }
 
-        websocketHandler.wait()
+    open suspend fun unsubscribe() {
+        val subId = channelConfig.subscriptionID ?: return
+        val success = unsubscribeFromChannel(
+            channelConfig.channelName,
+            subId,
+            "subscribe",
+            websocketHandler
+        )
+        if (!success) {
+            Log.e("BaseSubscription", "Failed to unsubscribe from channel ${channelConfig.channelName}")
+        } else {
+            websocketHandler.removeSubscription(channelConfig.channelName)
+        }
+    }
+
+    open fun reconnect() {
+        if (channelConfig.channelName != "art_config" && channelConfig.channelName != "art_secure") {
+            if (isListening) {
+                scope.launch { validateSubscription("presence") }
+            }
+            scope.launch {
+                runCatching { subscribe() }
+                    .onFailure { Log.e("BaseSubscription", "Channel reconnection failed: $it") }
+            }
+        }
+    }
+
+    /**
+     * Push a message to the channel with a specific event and data.
+     * @param event The event name.
+     * @param data The data to send.
+     */
+    open suspend fun push(event: String, data: Any, options: PushConfig? = null): Any? {
+        websocketHandler.waitForConnection()
+        websocketHandler.ensureAuthorization()
 
         val connection = websocketHandler.getConnection()
         val to = options?.to ?: emptyList<String>()
-        val threadId = options?.threadId
+        val threadId = options?.ThreadID
         var messageStr = gson.toJson(data)
-        // ---- Targeted / Secure validation ----
-        if ((channelConfig.channelType == "secure"
-                    || channelConfig.channelType == "targeted")
-            && event != "art_presence"
-        ) {
-            if (to.size != 1) {
+
+        if (channelConfig.channelType == "secure" || channelConfig.channelType == "targeted") {
+            if ((to.isEmpty() || to.size != 1) && event != "art_presence") {
                 throw IllegalArgumentException("Exactly one user must be specified for sending message.")
             }
         }
 
-        /* ---- Secure encryption ---- */
-        if (channelConfig.channelType == "secure"
-            && event != "art_presence"
-        ) {
-            val res =
-                websocketHandler.pushForSecureLine(
-                    "secured_public_key",
-                    mapOf("username" to to[0]),
-                    true
-                )
-
-            val resMap = res as? Map<*, *>
-                ?: throw Exception("Invalid secure response format")
-
-            val responseData = resMap["data"] as? Map<*, *>
-                ?: throw Exception("Missing data in secure response")
-
-            val status = responseData["status"]?.toString()
-
-            if (status == "unsuccessfull") {
-                throw Exception(responseData["error"]?.toString() ?: "Unknown error")
-            }
-
-            messageStr = websocketHandler.encrypt(
-                messageStr,
-                responseData["public_key"].toString()
+        if (channelConfig.channelType == "secure" && event != "art_presence") {
+            val secureRes = websocketHandler.pushForSecureLine(
+                "secured_public_key",
+                mapOf("username" to to[0]),
+                true
             )
+            val resData = (secureRes as? Map<*, *>)?.get("data") as? Map<*, *>
+                ?: throw Exception("Missing data in secure response")
+            if (resData["status"]?.toString() == "unsuccessfull") {
+                throw Exception(resData["error"]?.toString() ?: "")
+            }
+            messageStr = websocketHandler.encrypt(messageStr, resData["public_key"].toString())
         }
-
-        /* ---- Ref ID & ACK Promise ---- */
 
         var refId: String? = null
         val ackDeferred = CompletableDeferred<Any?>()
+        var rejectAck: ((ConnectionError) -> Unit)? = null
 
         if (channelConfig.channelName !in listOf("art_config", "art_secure", "art_presence")) {
-
             messageCount++
-            refId = "${connection?.connectionId}_${channelConfig.channelName}_$messageCount"
-
-            val timer = scope.launch {
-                delay(ACK_TIMEOUT)
-                pendingAcks.remove(refId)
-                ackDeferred.completeExceptionally(Exception("ACK timeout"))
+            refId = "${websocketHandler.getConnection()?.ConnectionId}_${channelConfig.channelName}_$messageCount"
+            if (channelConfig.channelType == "targeted" || channelConfig.channelType == "secure") {
+                val rid = refId
+                val timer = scope.launch {
+                    delay(ACK_TIMEOUT)
+                    pendingAcks.remove(rid)
+                    ackDeferred.completeExceptionally(
+                        ConnectionError(
+                            "The server has not acknowledged this request. Check its status before retrying.",
+                            "ACK_TIMEOUT"
+                        )
+                    )
+                }
+                rejectAck = { error -> ackDeferred.completeExceptionally(error) }
+                pendingAcks[rid] = Pair(ackDeferred, timer)
+            } else {
+                ackDeferred.complete(refId)
             }
-
-            pendingAcks[refId] = Pair(ackDeferred, timer)
-
         } else {
             ackDeferred.complete(null)
         }
 
-        val message = mapOf(
-            "from" to (connection?.connectionId ?: ""),
+        val message = mutableMapOf<String, Any?>(
+            "from" to (connection?.ConnectionId ?: ""),
             "to" to to,
-            "channel" to channelConfig.channelName,
+            "channel" to channelConfig.channelName +
+                (if (channelConfig.channelNamespace.isNotBlank()) ":${channelConfig.channelNamespace}" else ""),
             "event" to event,
             "content" to messageStr,
             "ref_id" to refId,
             "thread_id" to threadId
         )
+        options?.FileMeta?.let { if (it.isNotEmpty()) message["file_meta"] = it }
+        options?.ExecutionOrigin?.let { message["execution_origin"] = it }
 
-        websocketHandler.sendMessage(message.toJson())
-
-        return ackDeferred.await()
+        val onFailure: (ConnectionError) -> Unit = { error -> rejectAck?.invoke(error) }
+        onConnectionFailure(onFailure)
+        return try {
+            websocketHandler.sendMessage(Gson().toJson(message))
+            ackDeferred.await()
+        } finally {
+            offConnectionFailure(onFailure)
+            refId?.let { rid ->
+                pendingAcks[rid]?.let { it.second.cancel() }
+                pendingAcks.remove(rid)
+            }
+        }
     }
 
     open fun handleMessage(event: String, payload: Any) {}
@@ -337,16 +301,13 @@ open class BaseSubscription(
     }
 }
 
+data class PresenceConfig(
+    val unique: Boolean = true
+)
+
+/** Handle returned by [BaseSubscription.fetchPresence]; mirrors the TS `{ unsubscribe }`. */
+class PresenceSubscription(val unsubscribe: suspend () -> Unit)
+
 /* ---------------- Helpers ---------------- */
 
-private val gson = Gson()
 
-fun Any.toJson(): String = gson.toJson(this)
-
-private fun <T> MutableList<T>.synchronizedAdd(item: T) {
-    synchronized(this) { add(item) }
-}
-
-private fun <T> MutableList<T>.synchronizedRemove(item: T) {
-    synchronized(this) { remove(item) }
-}

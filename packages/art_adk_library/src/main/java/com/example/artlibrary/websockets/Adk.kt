@@ -8,13 +8,21 @@ import com.example.artlibrary.agentic.Orchestrator
 import com.example.artlibrary.auth.Auth
 import com.example.artlibrary.config.Constant
 import com.example.artlibrary.crypto.CryptoBox
+import com.example.artlibrary.storage.FileRef
+import com.example.artlibrary.storage.ListFilesResult
+import com.example.artlibrary.storage.ListOptions
+import com.example.artlibrary.storage.Storage
+import com.example.artlibrary.storage.StorageFile
+import com.example.artlibrary.storage.UploadOptions
 import com.example.artlibrary.types.AdkConfig
-import com.example.artlibrary.types.CredentialStore
 import com.example.artlibrary.types.AuthenticationConfig
 import com.example.artlibrary.types.CallApiProps
+import com.example.artlibrary.types.ConnectConfig
 import com.example.artlibrary.types.ConnectionDetail
+import com.example.artlibrary.types.ConnectionError
+import com.example.artlibrary.types.CredentialStore
 import com.example.artlibrary.types.KeyPairType
-import com.example.artlibrary.websockets.Interception
+import com.example.artlibrary.types.UpdateProfileData
 import com.google.gson.Gson
 import kotlinx.coroutines.*
 import okhttp3.*
@@ -40,21 +48,83 @@ interface AdkPlugin<N : CharSequence, T> {
     val name: N
     fun install(ctx: AdkPluginContext): T
 }
+
 @RequiresApi(Build.VERSION_CODES.O)
 class Adk(config: AdkConfig? = null) {
     protected val socket: Socket = Socket.create(::encrypt, ::decrypt)
     private var reconnectAttempts = 0
     private val maxReconnectAttempts = 5
     private var reconnectDelay = 3000L
-    private val maxDelay = 30000L
+    private val maxDelay = 5000L
     protected var myKeyPair: KeyPairType? = null
-    private var isPaused = false
     protected var adkConfig: AdkConfig? = null
+    private var isPaused = false
     var isConnectable = false
     private var isLimitExceeded = false
     private var credentialData: CredentialStore? = null
+    private var reconnectTimer: Job? = null
+    private var connectionAttempt: Deferred<Unit>? = null
+    private val storage = Storage()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val plugins = mutableMapOf<String, Any?>()
+    private val httpClient = OkHttpClient()
+
+    private fun cancelReconnect() {
+        reconnectTimer?.cancel()
+        reconnectTimer = null
+    }
+
+    private val handleConnectionFailed: (Any?) -> Unit = {
+        isConnectable = false
+        cancelReconnect()
+    }
+
+    private val handleLimitExceeded: (Any?) -> Unit = { detail ->
+        val map = detail as? Map<*, *>
+        val code = map?.get("code") as? String
+        val error = map?.get("error") as? String
+        val msg = if (code == "CONCURRENT_LIMIT_EXCEEDED") {
+            "[ART] Concurrent connection limit reached: $error. All reconnection attempts stopped. Call connect() again to retry."
+        } else {
+            "[ART] Billing limit reached: $error. All reconnection attempts permanently stopped."
+        }
+        Log.e("ADK", msg)
+        isLimitExceeded = true
+        isConnectable = false
+        cancelReconnect()
+    }
+
+    private val handleAuthenticationFailed: (Any?) -> Unit = { detail ->
+        val map = detail as? Map<*, *>
+        val status = (map?.get("status") as? Number)?.toInt() ?: 0
+        val error = map?.get("error") as? String
+        Log.e(
+            "ADK",
+            "[ART] Authentication rejected${if (status != 0) " with HTTP $status" else ""}: $error. " +
+                "Automatic reconnection has been stopped. Update the credentials and call connect() again."
+        )
+        isConnectable = false
+        cancelReconnect()
+        socket.isReConnecting = false
+    }
+
+    private val handleOnConnection: (Any?) -> Unit = { raw ->
+        val wasReconnecting = reconnectAttempts > 0 || socket.isReConnecting
+        cancelReconnect()
+        reconnectAttempts = 0
+        reconnectDelay = 3000
+        (raw as? ConnectionDetail)?.let { onConnectedHook(it) }
+        if (wasReconnecting) socket.emit("reconnected", null)
+    }
+
+    private val handleOnClose: (Any?) -> Unit = {
+        if (!isLimitExceeded) {   // billing limit hit — never reconnect
+            if (isConnectable && connectionAttempt == null) {
+                socket.isReConnecting = true
+                handleReconnection()
+            }
+        }
+    }
 
     init {
         val rawUrl = config?.uri
@@ -63,70 +133,91 @@ class Adk(config: AdkConfig? = null) {
         Constant.SSE_URL = "https://${rawUrl}/v1/connect/sse"
         Constant.LPOLL = "https://${rawUrl}/v1/connect/longpoll"
 
-        socket.on("connection") { handleOnConnection(it as ConnectionDetail) }
-        socket.on("close") { handleOnClose() }
-        socket.on("limitExceeded") { detail ->
-            val map = detail as? Map<*, *>
-            val code = map?.get("code") as? String
-            val error = map?.get("error") as? String
-            val msg = if (code == "CONCURRENT_LIMIT_EXCEEDED") {
-                "[ART] Concurrent connection limit reached: ${error}. All reconnection attempts stopped. Call connect() again to retry."
-            } else {
-                "[ART] Billing limit reached : ${error}. All reconnection attempts permanently stopped."
-            }
-            println(msg)
-            isLimitExceeded = true
-            isConnectable = false
-        }
         adkConfig = config
+        attachLifecycle()
     }
 
+    private fun attachLifecycle() {
+        detachLifecycle()
+        on("connection", handleOnConnection)
+        on("close", handleOnClose)
+        socket.on("limitExceeded", handleLimitExceeded)
+        socket.on("authenticationFailed", handleAuthenticationFailed)
+        socket.on("connectionFailed", handleConnectionFailed)
+    }
 
-    suspend fun connect() {
+    private fun detachLifecycle() {
+        off("connection", handleOnConnection)
+        off("close", handleOnClose)
+        socket.off("limitExceeded", handleLimitExceeded)
+        socket.off("authenticationFailed", handleAuthenticationFailed)
+        socket.off("connectionFailed", handleConnectionFailed)
+    }
+
+    suspend fun connect(config: ConnectConfig? = null) {
+        connectionAttempt?.let { return it.await() }
+        if (socket.isConnectionActive) return
+        attachLifecycle()
+        cancelReconnect()
+        isPaused = false
+        isLimitExceeded = false
+        reconnectAttempts = 0
+        reconnectDelay = 3000
+        socket.beginConnection(adkConfig?.connectionTimeoutMs?.toLong() ?: 30_000L)
         if (adkConfig?.autoLoadCredsFromJSON == true) {
             credentialData = loadConfig().toCredentialStore()
         }
         isConnectable = true
-        initiateSocketConnection()
+        attemptConnection().await()
     }
 
-    suspend fun pause() {
+    private fun attemptConnection(): Deferred<Unit> {
+        connectionAttempt?.let { return it }
+        val attempt = scope.async {
+            coroutineScope {
+                val a = async { initiateSocketConnection() }
+                val b = async { socket.waitForConnection() }
+                a.await()
+                b.await()
+            }
+            Unit
+        }
+        connectionAttempt = attempt
+        attempt.invokeOnCompletion {
+            if (connectionAttempt === attempt) connectionAttempt = null
+        }
+        return attempt
+    }
+
+    fun pause() {
         if (isPaused) return
         isPaused = true
+        isConnectable = false
+        cancelReconnect()
         // stop any reconnection loop
         reconnectAttempts = maxReconnectAttempts
         // close the socket
-        socket.closeWebSocket()
+        socket.failConnection(ConnectionError("The connection is paused.", "CONNECTION_PAUSED"))
     }
 
-    @RequiresApi(Build.VERSION_CODES.O)
     suspend fun resume() {
         if (!isPaused) return
-        isPaused = false
-        reconnectAttempts = 0
-        reconnectDelay = 3000
-        socket.connectWebSocket()
+        connect()
     }
 
-    fun disconnect() {
+    suspend fun disconnect() {
         isConnectable = false
+        cancelReconnect()
+        socket.failConnection(ConnectionError("The connection was closed.", "CONNECTION_CLOSED"))
         // stop any further reconnection attempts
         reconnectAttempts = maxReconnectAttempts
-        scope.launch {
-            socket.closeWebSocket(true)
-        }
+        // close the underlying WebSocket
+        socket.closeWebSocket(true)
+        // reset internal state so you can reconnect later if needed
+        socket.isConnectionActive = false
+        socket.pendingSendMessges.clear()
+        detachLifecycle()
     }
-
-    // fun setCredentials(credentials: AuthenticationConfig) {
-    //     this.credentials = {
-    //         ClientID: credentials.ClientID,
-    //         ClientSecret: credentials.ClientSecret,
-    //         Environment: credentials.Environment,
-    //         OrgTitle: credentials.OrgTitle,
-    //         ProjectKey: credentials.ProjectKey,
-    //     }
-    //     Auth.getInstance().setCredentials(this.credentials)
-    // }
 
     fun getState(): String {
         return when {
@@ -139,91 +230,56 @@ class Adk(config: AdkConfig? = null) {
     }
 
     private suspend fun initiateSocketConnection() {
-        val config = adkConfig
-            ?: throw IllegalStateException("AdkConfig is null. Initialize SDK properly.")
-        credentialData?.let { seeded ->
-            val authConfig = AuthenticationConfig(
-                environment = seeded.environment,
-                projectKey = seeded.projectKey,
-                orgTitle = seeded.orgTitle,
-                clientID = seeded.clientID,
-                clientSecret = seeded.clientSecret,
-                config = config,
-                accessToken = seeded.accessToken,
-                getCredentials = config.getCredentials
+        val creds = credentialData
+        if (creds == null) {
+            val error = ConnectionError(
+                "Connection credentials are missing. Please sign in again.",
+                "AUTHENTICATION_FAILED"
             )
-            this.socket.initiateSocket(authConfig)
-            return
+            socket.failConnection(error)
+            throw error
         }
-        val authConfig = if (config.getCredentials == null) {
-            loadConfig().apply {
-                this.config = config
-                this.getCredentials = null
-            }
-        } else {
-            AuthenticationConfig(
-                environment = "",
-                projectKey = "",
-                orgTitle = "",
-                clientID = "",
-                clientSecret = "",
-                accessToken = null
-            ).apply {
-                this.config = config
-                this.getCredentials = config.getCredentials
-            }
-        }
-
-        config.getCredentials?.invoke()?.let { creds ->
-            authConfig.environment = creds.environment
-            authConfig.projectKey = creds.projectKey
-            authConfig.orgTitle = creds.orgTitle
-            authConfig.clientID = creds.clientID
-            authConfig.clientSecret = creds.clientSecret
-            authConfig.accessToken = creds.accessToken
-        }
-
-        this.socket.initiateSocket(authConfig)
-    }
-
-    private fun handleOnConnection(connection: ConnectionDetail) {
-        this.reconnectAttempts = 0
-        this.reconnectDelay = 3000
-
-        // Call the hook so child classes can do something here
-        this.onConnectedHook(connection)
-    }
-
-    private fun handleOnClose() {
-        if (this.isLimitExceeded) return // billing limit hit — never reconnect
-        if (this.isConnectable) {
-            socket.isReConnecting = true
-            handleReconnection()
-        }
+        val authConfig = AuthenticationConfig(
+            environment = creds.environment,
+            projectKey = creds.projectKey,
+            orgTitle = creds.orgTitle,
+            clientID = creds.clientID,
+            clientSecret = creds.clientSecret,
+            config = adkConfig,
+            accessToken = creds.accessToken,
+            getCredentials = adkConfig?.getCredentials
+        )
+        socket.initiateSocket(authConfig)
+        socket.waitForConnection()
     }
 
     private fun handleReconnection() {
-        if (this.isLimitExceeded) return // billing limit hit — never reconnect
-        scope.launch {
-            if (reconnectAttempts < maxReconnectAttempts) {
-                reconnectAttempts++
-
+        if (isLimitExceeded || !isConnectable || isPaused || reconnectTimer != null) return
+        if (reconnectAttempts < maxReconnectAttempts) {
+            reconnectAttempts++
+            Log.i("ADK", "Attempting to reconnect in ${reconnectDelay / 1000} seconds... (Attempt $reconnectAttempts)")
+            reconnectTimer = scope.launch {
                 delay(reconnectDelay)
-
+                reconnectTimer = null
+                if (!isConnectable || isPaused || isLimitExceeded) return@launch
+                scope.launch {
+                    runCatching { attemptConnection().await() }.onFailure {
+                        if (isConnectable) handleReconnection()
+                    }
+                }
+                // Exponential backoff, capped at maxDelay
                 reconnectDelay = minOf(reconnectDelay + 2000, maxDelay)
-
-                connect()
-            } else {
-                Log.w("ADK", "Max reconnect attempts reached. Retrying every ${maxDelay / 1000}s")
-
-                delay(maxDelay)
-
-                connect()
             }
+        } else {
+            socket.failConnection(
+                ConnectionError(
+                    "The connection could not be restored. Please reconnect to check your execution.",
+                    "CONNECTION_LOST"
+                )
+            )
         }
     }
 
-    // Overload for 'open' event
     fun on(event: String, callback: (Any?) -> Unit): Adk {
         socket.on(event, callback)
         return this
@@ -233,6 +289,29 @@ class Adk(config: AdkConfig? = null) {
         socket.off(event, callback)
         return this
     }
+
+    /**
+     * Fires each time the transport reconnects after a drop. Returns the
+     * registered listener handle to pass to [offReconnected].
+     */
+    fun onReconnected(callback: () -> Unit): (Any?) -> Unit {
+        val wrapper: (Any?) -> Unit = { callback() }
+        on("reconnected", wrapper)
+        return wrapper
+    }
+
+    fun offReconnected(handle: (Any?) -> Unit) {
+        off("reconnected", handle)
+    }
+
+    /** Typed connection state (mirrors the Swift `adk.state`). */
+    val state: ConnectionState
+        get() = when (getState()) {
+            "connected" -> ConnectionState.CONNECTED
+            "paused" -> ConnectionState.PAUSED
+            "retrying" -> ConnectionState.RECONNECTING
+            else -> ConnectionState.DISCONNECTED
+        }
 
     // Kotlin doesn't have overloads by event name like TS,
     // so handle specific event types inside the callback
@@ -266,10 +345,9 @@ class Adk(config: AdkConfig? = null) {
         return this
     }
 
-    fun setCredentials(credentials: CredentialStore) {
-        credentialData = credentials
+    fun setCredentials(config: CredentialStore) {
+        credentialData = config
     }
-
 
     /**
      * Subscribe to a specific channel via Socket.
@@ -300,19 +378,14 @@ class Adk(config: AdkConfig? = null) {
         return Orchestrator(orchestratorId, socket)
     }
 
-    /**
-     * Install an opt-in [plugin] and return its API. Mirrors the JS `use()`.
-     * Kotlin can't attach a dynamically-named, typed property to `this` the way
-     * TypeScript does (`this & Record<N, T>`), so instead of
-     * `adk.use(p); adk.name…` you keep the returned handle
-     * (`val api = adk.use(p)`), or fetch it later by name with [plugin].
-     */
-    // requires a backing registry on the class:  private val plugins = mutableMapOf<String, Any?>()
+    // NOTE: the TS `connector(connectorId)` returns `new Connector(connectorId, socket)`,
+    // but there is no `Connector` class in the Kotlin codebase yet — port that file
+    // first and this method can be added verbatim.
 
     fun <N : CharSequence, T> use(plugin: AdkPlugin<N, T>): T {
-        val api = plugin.install(pluginContext())   // const api = plugin.install(this.pluginContext());
-        plugins[plugin.name.toString()] = api       // (this as any)[plugin.name] = api;
-        return api                                   // return this as this & Record<N, T>;  ← see note
+        val api = plugin.install(pluginContext())
+        plugins[plugin.name.toString()] = api
+        return api
     }
 
     /** Retrieve a previously [use]d plugin's API by name. */
@@ -347,8 +420,10 @@ class Adk(config: AdkConfig? = null) {
     /**
      * Close the WebSocket connection.
      */
-    suspend fun closeWebSocket() {
-        socket.closeWebSocket()
+    fun closeWebSocket() {
+        isConnectable = false
+        cancelReconnect()
+        socket.failConnection(ConnectionError("The connection was closed.", "CONNECTION_CLOSED"))
     }
 
     suspend fun pushForSecureLine(
@@ -420,12 +495,11 @@ class Adk(config: AdkConfig? = null) {
         )
     }
 
-
     suspend fun savePublicKey(keyPair: KeyPairType): JSONObject = withContext(Dispatchers.IO) {
         val auth = Auth.getInstance()
         auth.authenticate()
-        val authData = auth.getAuthData();
-        val credentials = auth.getCredentials();
+        val authData = auth.getAuthData()
+        val credentials = auth.getCredentials()
 
         val body = JSONObject().put("public_key", keyPair.publicKey)
 
@@ -442,7 +516,7 @@ class Adk(config: AdkConfig? = null) {
         val response = httpClient.newCall(request).execute()
 
         if (!response.isSuccessful) {
-            throw Error("Error updating keypair");
+            throw Error("Error updating keypair")
         }
 
         val responseBody = response.body?.string() ?: throw Exception("Empty response body")
@@ -471,6 +545,26 @@ class Adk(config: AdkConfig? = null) {
         savePublicKey(keyPair)
     }
 
+    /**
+     * Update the authenticated user's profile.
+     * @param data Profile fields to update (all optional).
+     */
+    @RequiresApi(Build.VERSION_CODES.O)
+    suspend fun updateProfile(data: UpdateProfileData) {
+        call(
+            "/v1/update-profile",
+            CallApiProps(
+                method = "POST",
+                payload = mapOf(
+                    "first_name" to data.firstName,
+                    "last_name" to data.lastName,
+                    "email" to data.email,
+                    "attributes" to data.attributes
+                )
+            ),
+            Any::class.java
+        )
+    }
 
     // API Call Helper
     @RequiresApi(Build.VERSION_CODES.O)
@@ -552,6 +646,25 @@ class Adk(config: AdkConfig? = null) {
         }
     }
 
-    private val httpClient = OkHttpClient()
+    @RequiresApi(Build.VERSION_CODES.O)
+    suspend fun upload(file: ByteArray, opts: UploadOptions = UploadOptions()): FileRef {
+        return storage.upload(file, opts)
+    }
 
+    @RequiresApi(Build.VERSION_CODES.O)
+    suspend fun listFiles(opts: ListOptions = ListOptions()): ListFilesResult {
+        return storage.listFiles(opts)
+    }
+
+    // NOTE: the TS `getFile(fileId, opts: FileAccessOptions)` / `deleteFile(fileId, { hard, timeoutMs })`
+    // are adapted to the Kotlin Storage signatures (there is no FileAccessOptions type).
+    @RequiresApi(Build.VERSION_CODES.O)
+    suspend fun getFile(fileId: String, timeoutMs: Long? = null): StorageFile {
+        return storage.getFile(fileId, timeoutMs)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    suspend fun deleteFile(fileId: String, hard: Boolean = false, timeoutMs: Long? = null) {
+        return storage.deleteFile(fileId, hard, timeoutMs)
+    }
 }

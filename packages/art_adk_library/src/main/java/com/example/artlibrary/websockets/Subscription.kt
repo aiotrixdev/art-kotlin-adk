@@ -16,6 +16,7 @@ import com.example.artlibrary.types.ChannelConfig
 import com.example.artlibrary.types.IWebsocketHandler
 import com.example.artlibrary.types.PushConfig
 import org.json.JSONObject
+import org.json.JSONTokener
 
 class Subscription(
     connectionID: String,
@@ -146,12 +147,10 @@ class Subscription(
             )
         }
 
-        // 4. Parse content
-        var content: Map<String, Any?> = if (payload.containsKey("data")) {
-            runCatching { JSONObject(payload["data"].toString()).toMap() }.getOrDefault(emptyMap())
-        } else {
-            runCatching { JSONObject(payload.toString()).toMap() }.getOrDefault(emptyMap())
-        }
+        // 4. Parse content — `data` arrives as JSON text, or already as an object
+        //    (e.g. thread_state); with no `data`, the payload itself is the content.
+        var content: Map<String, Any?> =
+            decodeContent(if (payload.containsKey("data")) payload["data"] else payload)
 
         // 5. Human feedback detection — mirrors JS humanFeedbackRequest block
         val isHumanFeedbackRequest =
@@ -206,6 +205,22 @@ class Subscription(
                 )
             )
         }
+    }
+
+    /**
+     * Decode a message's `content` into a map. An object is kept as-is (as Swift
+     * does). Text is parsed: normal channels send a JSON object string (`{...}`);
+     * the agent channel double-encodes it as a JSON string that *holds* that object
+     * (`"{...}"`), so a pass that yields a string is parsed once more.
+     */
+    private fun decodeContent(raw: Any?): Map<String, Any?> = when (raw) {
+        is Map<*, *> -> raw.entries.associate { (k, v) -> k.toString() to v }
+        is String -> runCatching {
+            val first = JSONTokener(raw).nextValue()
+            val obj = if (first is String) JSONTokener(first).nextValue() else first
+            (obj as? JSONObject)?.toMap() ?: emptyMap()
+        }.getOrDefault(emptyMap())
+        else -> emptyMap()
     }
 
     private fun emitEvent(event: String, content: Any?, config: Map<String, Any?> = emptyMap()) {
@@ -305,7 +320,7 @@ class Subscription(
             "namespace"       to originalReq["namespace"],
             "id"              to originalReq["id"],
             "ref_id"          to originalReq["ref_id"],
-            "from"            to (conn?.connectionId ?: ""),
+            "from"            to (conn?.ConnectionId ?: ""),
             "to"              to (if (originalReq["from"] != null) listOf(originalReq["from"]) else emptyList<String>()),
             "to_username"     to originalReq["to_username"],
             "from_username"   to originalReq["from_username"],
