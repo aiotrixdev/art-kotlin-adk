@@ -1,6 +1,5 @@
 package com.example.artlibrary.websockets
 
-import com.example.artlibrary.config.Events
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -29,12 +28,15 @@ open class EventEmitter {
     }
 
     fun emit(event: String, data: Any?) {
+        // Fire only this exact event's listeners, as Swift's `EventEmitter.emit`
+        // does. The emitter must NOT fan every event out to the "all" bucket:
+        // `Subscription.handleMessage` already routes each frame explicitly to
+        // "all" / "<threadId>-all" (see `emitEvent`). An emitter-level wildcard
+        // re-delivered every thread-tagged frame to the channel `listen`
+        // callback as `{event: "<threadId>-all", content: {event, content}}`,
+        // which `AgentThread.dispatch` then surfaced as spurious empty bubbles
+        // titled "<threadId>-all" (the routing key leaking in as the event).
         events[event]?.forEach { it(data) }
-        if (event != Events.ALL) {
-            events[Events.ALL]?.forEach {
-                it(mapOf("event" to event, "content" to data))
-            }
-        }
     }
 
     fun listeners(event: String): List<(Any?) -> Unit> =

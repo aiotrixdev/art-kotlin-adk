@@ -1,12 +1,14 @@
 package com.example.artlibrary.websockets
 
 import android.net.Uri
+import com.example.artlibrary.auth.AuthHttpError
+import com.example.artlibrary.auth.isTerminalAuthError
 import com.google.gson.Gson
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import java.io.IOException
+import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
@@ -56,6 +58,7 @@ class LongPollClient(private val opts: LongPollOptions) {
 
                 // Get Auth Headers
                 val authHeaders = opts.getAuthHeaders()
+                if (!isRunning) return
 
                 // Prepare Request
                 val requestBuilder = Request.Builder().url(url)
@@ -77,7 +80,16 @@ class LongPollClient(private val opts: LongPollOptions) {
                     }
 
                     if (!resp.isSuccessful) {
-                        throw IOException("Longpoll error: ${resp.code}")
+                        val body = runCatching { JSONObject(resp.body?.string() ?: "") }.getOrNull()
+                        val reason = body?.optString("error").takeUnless { it.isNullOrEmpty() }
+                            ?: body?.optString("message").takeUnless { it.isNullOrEmpty() }
+                        // A dead connection must be replaced, not polled indefinitely. New
+                        // bindings reconnect subscriptions but never replay an execution.
+                        if (resp.code == 410) connectionId = null
+                        throw AuthHttpError(
+                            reason ?: "Connection request failed (HTTP ${resp.code}).",
+                            resp.code
+                        )
                     }
 
                     // Reset backoff on success
@@ -93,21 +105,21 @@ class LongPollClient(private val opts: LongPollOptions) {
 
                     // Dispatch messages
                     if (!data.messages.isNullOrEmpty()) {
-                        withContext(Dispatchers.Main) {
-                            opts.onMessages(data.messages)
-                        }
+                        opts.onMessages(data.messages)
                     }
                 }
 
             } catch (e: CancellationException) {
-                // This happens when stop() or job.cancel() is called
-                break
+                // stop() was called
+                return
             } catch (e: Exception) {
-                // Network or Server error
-                withContext(Dispatchers.Main) {
+                if (isTerminalAuthError(e)) {
                     opts.onError?.invoke(e)
+                    isRunning = false
+                    return
                 }
-                // Backoff before retrying after an error
+                // network or server error → notify and backoff
+                opts.onError?.invoke(e)
                 delay(opts.retryDelayMs.toLong())
             }
         }

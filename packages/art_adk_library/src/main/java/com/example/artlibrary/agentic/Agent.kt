@@ -7,6 +7,7 @@ import com.example.artlibrary.storage.ListFilesResult
 import com.example.artlibrary.storage.ListOptions
 import com.example.artlibrary.storage.Storage
 import com.example.artlibrary.storage.UploadOptions
+import com.example.artlibrary.types.ConnectionError
 import com.example.artlibrary.websockets.Socket
 
 class Agent(
@@ -14,14 +15,33 @@ class Agent(
     socket: Socket
 ) : BaseWorkflow(socket) {
 
-    override fun channelName(): String = "agent_com_$agentId"
+    init {
+        validateExecutionReference(agentId)
+    }
 
+    override fun channelName(): String {
+        return "agent_com_$agentId"
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
     override fun connect(): Agent {
         super.connect()
         return this
     }
 
-    fun thread(threadId: String? = null): AgentThread = AgentThread(this, threadId)
+    fun thread(threadId: String? = null): AgentThread {
+        return AgentThread(this, threadId)
+    }
+
+    /** @internal — AgentThread uses this to terminate active runs when the
+     * shared transport rejects the tenant before a channel event can exist. */
+    fun onConnectionFailure(listener: (error: ConnectionError) -> Unit) {
+        socket.onConnectionFailure(listener)
+    }
+
+    fun offConnectionFailure(listener: (error: ConnectionError) -> Unit) {
+        socket.offConnectionFailure(listener)
+    }
 
     @RequiresApi(Build.VERSION_CODES.O)
     suspend fun upload(file: ByteArray, opts: UploadOptions = UploadOptions()): FileRef =
