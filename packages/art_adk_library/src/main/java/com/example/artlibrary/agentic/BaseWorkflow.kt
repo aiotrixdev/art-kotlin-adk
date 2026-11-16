@@ -1,5 +1,7 @@
 package com.example.artlibrary.agentic
 
+import android.os.Build
+import androidx.annotation.RequiresApi
 import com.example.artlibrary.websockets.Socket
 import com.example.artlibrary.websockets.Subscription
 import kotlinx.coroutines.*
@@ -12,19 +14,27 @@ abstract class BaseWorkflow(protected val socket: Socket) {
 
     protected abstract fun channelName(): String
 
+    @RequiresApi(Build.VERSION_CODES.O)
     open fun connect(): BaseWorkflow {
         if (subscribeJob == null) {
             subscribeJob = CoroutineScope(Dispatchers.Default).async {
-                val sub = socket.subscribe(channelName()) as Subscription
-                subscription = sub
-                sub
+                try {
+                    val sub = socket.subscribe(channelName()) as Subscription
+                    subscription = sub
+                    sub
+                } catch (error: Throwable) {
+                    subscribeJob = null
+                    throw error
+                }
             }
         }
         return this
     }
 
     /** @internal */
+    @RequiresApi(Build.VERSION_CODES.O)
     suspend fun getSubscription(): Subscription {
+        socket.waitForConnection()
         subscription?.let { return it }
         if (subscribeJob == null) connect()
         val job = subscribeJob!!

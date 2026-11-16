@@ -16,7 +16,7 @@ suspend fun subscribeToChannel(
     process: String,
     websocketHandler: IWebsocketHandler
 ): ChannelConfig {
-    websocketHandler.wait()
+    websocketHandler.waitForConnection()
 
     val subscriptionChannelName =
         if (process == "subscribe") "channel-subscribe" else "channel-presence"
@@ -36,13 +36,17 @@ suspend fun subscribeToChannel(
         // Diagnostic: the server returns only a one-line `error`, so log the whole
         // payload — it is the only way to see which config it actually resolved.
         AdkLog.e(TAG, "'$subscriptionChannelName' rejected for channel '$channel' -> $data")
-        throw IllegalStateException(data["error"]?.toString() ?: "Unknown error")
+        throw IllegalStateException(
+            data["error"]?.toString().takeUnless { it.isNullOrEmpty() }
+                ?: "The channel subscription was rejected."
+        )
     }
 
     val rawData = data["channelConfig"] as? Map<*, *>
-        ?: throw IllegalStateException("channelConfig missing in response")
+        ?: throw IllegalStateException("The server did not return a channel configuration.")
 
     return ChannelConfig(
+        configurationID = data["configurationID"]?.toString(),
         channelName = data["channel"]?.toString() ?: "",
         channelNamespace = data["channelNamespace"]?.toString() ?: "",
         channelType = rawData["TypeofChannel"]?.toString() ?: "",
@@ -60,7 +64,7 @@ suspend fun unsubscribeFromChannel(
     process: String,
     websocketHandler: IWebsocketHandler
 ): Boolean {
-    websocketHandler.wait()
+    websocketHandler.waitForConnection()
 
     val subscriptionChannelName =
         if (process == "subscribe") "channel-unsubscribe" else "presence-unsubscribe"
@@ -78,7 +82,10 @@ suspend fun unsubscribeFromChannel(
         ?: throw IllegalStateException("Invalid response format")
 
     if (data["status"] == "not-OK") {
-        throw IllegalStateException(data["error"]?.toString() ?: "Unknown error")
+        throw IllegalStateException(
+            data["error"]?.toString().takeUnless { it.isNullOrEmpty() }
+                ?: "The channel request was rejected."
+        )
     }
 
     return true
@@ -88,7 +95,7 @@ suspend fun getInterceptorConfig(
     interceptor: String,
     websocketHandler: IWebsocketHandler
 ): Any {
-    websocketHandler.wait()
+    websocketHandler.waitForConnection()
 
     return try {
         val response = websocketHandler.pushForSecureLine(
@@ -104,7 +111,10 @@ suspend fun getInterceptorConfig(
         } ?: throw IllegalStateException("Missing data in response")
 
         if (data["status"] == "not-OK") {
-            throw IllegalStateException(data["error"]?.toString() ?: "Unknown error")
+            throw IllegalStateException(
+                data["error"]?.toString().takeUnless { it.isNullOrEmpty() }
+                    ?: "The interceptor subscription was rejected."
+            )
         }
 
         data["interceptorConfig"]
