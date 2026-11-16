@@ -3,6 +3,9 @@ package com.example.artlibrary.websockets
 import com.example.artlibrary.config.AdkLog
 import com.example.artlibrary.config.ReturnFlags
 import com.example.artlibrary.types.IWebsocketHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 private const val TAG = "ArtInterception"
@@ -23,9 +26,15 @@ class Interception(
         }
     }
 
-    suspend fun reconnect() {
+    fun reconnect() {
         AdkLog.d(TAG, "reconnecting interceptor $interceptor")
-        validateInterception()
+        CoroutineScope(Dispatchers.Default).launch {
+            try {
+                validateInterception()
+            } catch (error: Exception) {
+                println("Interceptor reconnection failed: ${error.message}")
+            }
+        }
     }
 
     private fun createResponse(

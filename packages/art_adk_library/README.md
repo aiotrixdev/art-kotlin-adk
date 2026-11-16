@@ -1,30 +1,53 @@
-# ART - A Realtime Tech communication
+# ART Kotlin ADK
 
-Kotlin ADK for ART — A Realtime Tech communication, a realtime communication with WebSocket
-channels, AI Agents, AI Orchestrators, presence tracking, end-to-end encrypted messaging and
+The ART Kotlin ADK connects android apps to [ART (A Realtime Tech)](https://arealtimetech.com/), a
+realtime communication platform for building intelligent applications with WebSocket-based
+messaging, AI Agents, AI Orchestrators, presence tracking, end-to-end encrypted channels, and
 CRDT-backed shared objects.
 
-## Features
+With the ADK you can:
 
-- **WebSocket connection management** — connect, pause, resume, and auto-reconnect with exponential
-  backoff
-- **Channel subscriptions** — default, targeted, group, secure (encrypted), and shared-object (CRDT)
-  channels
-- **Push messages** — send structured payloads with optional per-user targeting
-- **Event listening** — receive every message with listen() or bind to named events via emitter.on()
-- **Presence tracking** — observe users online on a channel in real time
-- **End-to-end encryption** — crypto applied transparently on secure channels
-- **Interceptors** — hook into the message pipeline to resolve or reject payloads
-- **Shared objects (CRDT)** — collaborative state with automatic conflict resolution
-- **AI Agents** — interact with ART Agent Builder using threads, runs, typed events, and
-  Human-in-the-Loop (HITL)
-- **AI Orchestrators** — execute multi-agent workflows with thread-scoped conversations and workflow
-  events
-- **Storage** — upload, list, retrieve, and delete files with signed URLs and progress tracking
+- Send and receive messages in real time
+- See who is online in a channel
+- Encrypt conversations end-to-end
+- Keep shared data in sync across users and devices
+- Check or block messages before they are delivered
+- Chat with AI agents and run multi-agent workflows
+- Upload files and share them with AI agents
+- Receive in-app notifications
+
+## Contents
+
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Getting started](#getting-started)
+- [Connection](#connection)
+- [Channels and messages](#channels-and-messages)
+- [Presence](#presence)
+- [Encrypted channels](#encrypted-channels)
+- [Shared objects](#shared-objects)
+- [Interceptors](#interceptors)
+- [AI agents](#ai-agents)
+- [AI orchestrators](#ai-orchestrators)
+- [File storage](#file-storage)
+- [Profiles and connectors](#profiles-and-connectors)
+- [Notifications](#notifications)
+- [Calling ART APIs](#calling-art-apis)
+- [Errors](#errors)
+- [Logging](#logging)
+- [Documentation](#documentation)
+- [License](#license)
+
+## Requirements
+
+- Android 8.0 (API 26) or later
+- Kotlin 1.9+ with coroutines
+- Android Studio Hedgehog or later
+- An ART project with its environment, project key, organisation and client ID
 
 ## Installation
 
-Add this to your app's `settings.gradle.kts`:
+Add the repository in `settings.gradle.kts`:
 
 ```kotlin
 dependencyResolutionManagement {
@@ -35,19 +58,41 @@ dependencyResolutionManagement {
 }
 ```
 
-Then add the dependency in your app module:
+Add the dependency in your app module:
 
 ```kotlin
 dependencies {
     implementation("io.github.aiotrixdev:art-kotlin-adk:TAG")
+    implementation("com.aiotrix:art-adk-notifications:TAG")   // optional
+
 }
 ```
 
 Replace `TAG` with the GitHub release tag you publish through JitPack, for example `1.0.0`.
 
-## Configuration
+## Getting started
 
-### 1. Initialization
+#### 1. Get a user passcode
+
+ART signs users in with a short-lived passcode. Your backend requests the passcode from ART using
+your client secret, and returns only the passcode to the app:
+
+```kotlin
+suspend fun fetchPasscode(username: String): String = withContext(Dispatchers.IO) {
+    val body = JSONObject().put("username", username).toString()
+        .toRequestBody("application/json".toMediaType())
+    val request = Request.Builder().url("PASSCODE_URL").post(body).build()
+    OkHttpClient().newCall(request).execute().use { response ->
+        JSONObject(response.body?.string().orEmpty()).optString("passcode")
+    }
+}
+```
+
+**Important:** Never put your client secret in the app. Anything shipped inside an app can be
+extracted. Whether users can sign in using only a passcode depends on your ART project settings, so
+confirm this with the ART team before release.
+
+### 2. Create credentials and connect
 
 Configure the core ADK client with your environment credentials:
 
@@ -73,99 +118,127 @@ val adkConfig = AdkConfig(
 val adk = Adk(adkConfig)
 ```
 
-### 2. Generate Client Credentials
-
-Log in to the [ART Live Dashboard](https://dev.arealtimetech.com) and generate your client
-credentials. Save this JSON file under asset/adk-services.json:
-
-```json
-{
-  "Client-ID": "xxxxxxxxxx",
-  "Client-Secret": "xxxxxxxxxxx",
-  "Org-Title": "YOUR_ORG",
-  "ProjectKey": "YOUR_PROJECT_KEY",
-  "Environment": "YOUR_ENV_NAME"
-}
-```
-
-See [Workspace and Project]() for how to obtain ProjectKey and Environment.
-
-## 3. Load credentials
+### 3. Send and receive a message
 
 ```kotlin
-fun loadCredentials(context: Context): AuthenticationConfig {
-    val jsonString = context.assets.open("adk-services.json").bufferedReader().use { it.readText() }
+val channel = adk.subscribe("CHANNEL_NAME")
 
-    val json = JSONObject(jsonString)
-
-    return AuthenticationConfig(
-        environment = json.getString("Environment"),
-        projectKey = json.getString("ProjectKey"),
-        orgTitle = json.getString("Org-Title"),
-        clientID = json.getString("Client-ID"),
-        clientSecret = json.getString("Client-Secret"),
-    )
+channel.on("all") { data ->
+    Log.d("ART", "Received: $data")
 }
+
+channel.push(event = "message", data = mapOf("text" to "Hello ART!"))
 ```
 
-### 4. Generate a Passcode
+Run these calls from a coroutine such as viewModelScope.launch { ... }. For anything that blocks,
+such as presence or interceptors, switch to Dispatchers.IO.
 
-Use the [ART REST API]() to generate an authentication passcode before connecting.
+## Connection
 
-## Quick Start
-
-The package includes a complete Kotlin example demonstrating every major ART ADK capability from a
-single application.
-The example covers
-
-- Connection management
-- Channel subscriptions
-- Presence tracking
-- Publish / Subscribe messaging
-- Secure messaging
-- CRDT shared objects
-- Message interceptors
-- AI Agent integration
-- AI Orchestrator workflows
-- Storage
-
-### Connecting & Managing Lifecycle
-
-Use coroutines to manage connections:
+`connect()` opens the connection, signs the user in, and returns once ART has accepted the
+connection. If the connection drops, the ADK reconnects automatically.
 
 ```kotlin
-lifecycleScope.launch {
+val onConnection: (Any?) -> Unit = { Log.d("ART", "Connected") }
+val onClose: (Any?) -> Unit = { reason -> Log.d("ART", "Closed, reconnecting: $reason") }
 
-    val creds = loadCredentials()
-    val passcode = fetchPasscode(creds)
-    val updatedCreds = creds.copy(accessToken = passcode)
+adk.on("connection", onConnection)
+adk.on("close", onClose)
 
-    val adk = Adk(
-        AdkConfig(
-            uri = "ws.arealtimetech.com",
-            authToken = token,
-            root = "",
-            getCredentials = {
-                updatedCreds
-            }
-        )
-    )
+// Remove the listeners when you no longer need them:
+adk.off("connection", onConnection)
+adk.off("close", onClose)
 
-    adk.on {
-        Log.d("ADK", "Connected Successfully!")
-    }
-    // Listen FIRST
-    adk.onConnection {
-        Log.d("ADK", "Connected Successfully!")
-    }
-
-    adk.onLimitExceeded { code, error ->
-        Log.e("ADK", "Billing limit or concurrent limit reached: $error")
-    }
-    // Connect to WebSockets
+try {
     adk.connect()
+} catch (e: Exception) {
+    Log.e("ART", "Couldn't connect", e)
 }
 ```
+
+connect() throws a ConnectionError when it can't connect: AUTHENTICATION_FAILED when the credentials
+are missing or ART rejects them, or CONNECTION_TIMEOUT when the connection isn't ready in time.
+Calls made while a connection attempt is in progress share it.
+
+By default the ADK waits up to 30 seconds for the connection, for a sign-in request and for ART's
+reply to a request such as a subscribe. To change this, set connectionTimeoutMs to a positive
+number; anything else makes connect() throw ARTError.invalidArgument. It doesn't limit how long an
+agent can take to answer.
+
+## When the connection fails
+
+Sometimes the connection can't continue: the credentials were rejected, a limit was reached, you
+paused or closed the connection, or it couldn't be restored after five attempts. The ADK then emits
+`connectionFailed` with a `ConnectionError` and stops reconnecting. Agent runs in progress end with
+an error, and later sends and subscribes throw the same `ConnectionError` until you call `connect()`
+again.
+
+```Kotlin
+adk.on("connectionFailed") { data -> Log.w("ART", "Connection failed: $data") }
+```
+
+| **Code**                                                         | **Meaning**                                                                                          |
+|------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
+| `AUTHENTICATION_FAILED`                                          | The credentials are missing or were rejected. `status` holds the HTTP status when ART rejected them. |
+| `CONNECTION_TIMEOUT`                                             | The connection, or ART's reply to a request, didn't arrive in time                                   |
+| `CONNECTION_LOST`                                                | The connection dropped before a message could be sent, or couldn't be restored                       |
+| `CONNECTION_PAUSED`, `CONNECTION_CLOSED`                         | You called `pause()`, `closeWebSocket()` or `disconnect()`                                           |
+| `CONNECTION_CANCELLED`                                           | A newer connection attempt replaced this one                                                         |
+| `CONNECTION_AUTHORIZATION_FAILED`                                | The connection's sign-in couldn't be renewed                                                         |
+| `ACK_TIMEOUT`                                                    | ART didn't confirm a message                                                                         |
+| `CONNECTION_MINUTES_LIMIT_EXCEEDED`, `CONCURRENT_LIMIT_EXCEEDED` | Your project reached its billing or concurrency limit                                                |
+
+`adk.state` tells you where the connection stands:
+
+| **State**     | **Meaning**                                              |
+|---------------|----------------------------------------------------------|
+| `.connecting` | Opening the connection, or reconnecting after it dropped |
+| `.connected`  | Connected and signed in                                  |
+| `.paused`     | Paused with `pause()`                                    |
+| `.stopped`    | Not connected                                            |
+
+If your project reaches its billing or concurrency limit, the ADK also emits a `limitExceeded`event.
+
+## Channels and messages
+
+A channel is a named stream of messages. Subscribe to a channel to send and receive messages on it.
+`subscribe` returns a `Subscription` for regular channels and a `LiveObjSubscription`
+for [shared-object channels](#shared-objects).
+
+```kotlin
+val channel = adk.subscribe("room-42")
+
+// When you no longer need the channel:
+channel.unsubscribe()
+```
+
+### Sending messages
+
+```kotlin
+channel.push(event = "message", data = mapOf("text" to "Hello"))
+```
+
+To send a message to specific users, list their usernames in the `to` option:
+
+```kotlin
+channel.push(
+    event = "message",
+    data = mapOf("text" to "Hi Bob"),
+    options = PushConfig(to = listOf("bob"))
+)
+```
+
+### Receiving messages
+
+```kotlin
+channel.emitter.on("message") {
+    data in
+            print("Received:", data)
+}
+```
+
+On regular channels, `bind(event:)` also delivers messages that arrived before you started
+listening. It returns a token that you can use to remove that listener later:
 
 ### User Presence
 
@@ -200,64 +273,11 @@ Unsubscribe when you no longer need the channel:
 sub.unsubscribe()
 ```
 
-### Pushing messages
-
-```kotlin
-// Send a message
-sub.push(
-    event = "message",
-    data = mapOf("text" to "Hello")
-)
-```
-
-Target a specific user (required for secure and targeted channels — exactly one recipient):
-
-```kotlin
-sub.push(
-    event = "message",
-    data = mapOf("text" to "Hi Bob"),
-    options = PushConfig(to = listOf("bob"))
-)
-```
-
-Attempting to target zero or more than one recipient on a secure / targeted channel throws
-ARTError.serverError.
-
-###Receiving messages
-
-Bind to a specific event on the subscription's emitter:
-
-```kotlin
-sub.emitter.on("message") { data ->
-    Log.d("ART", "got: $data")
-}
-```
-
-Or, on default channels, cast to Subscription and stream every event:
-
-```kotlin
-if (sub is Subscription) {
-    sub.listen { data: Map<String, Any> ->
-        Log.d(
-            "ART",
-            "event=${data["event"]} content=${data["content"]}"
-        )
-    }
-}
-```
-
-Unbind a specific listener:
-
-```kotlin
-if (sub is Subscription) {
-    sub.remove(event = "message")
-}
-```
-
 ### Encrypted channels
 
-You can automatically generate key pairs and encrypt payloads directly over the wire
-using `libsodium`:
+Messages on encrypted channels are encrypted on the sender's device, and only the recipients can
+read them. Before using an encrypted channel, create a key pair for the current user.
+generateKeyPair() creates the keys and registers the public key with ART.
 
 ```kotlin
 lifecycleScope.launch {
@@ -296,8 +316,9 @@ Interceptors never see encrypted channel traffic — ART preserves message priva
 
 ## Shared object channels (CRDT)
 
-Shared-object channels expose a JSON-like document that every subscriber edits concurrently;
-conflicts are resolved automatically via the SDK's CRDT engine.
+A shared-object channel holds a document that every subscriber can read and edit. Changes are merged
+automatically using CRDTs (conflict-free replicated data types), so everyone ends up with the same
+data.
 
 ```kotlin
 val sub = adk.subscribe("YOUR_CRDT_CHANNEL")
@@ -325,7 +346,7 @@ if (sub is LiveObjSubscription) {
 }
 ```
 
-## Array operations
+## Lists support the usual operations:
 
 ```kotlin
 val items = sub.state()["items"]   // CRDTProxy
@@ -349,6 +370,9 @@ Log.d("ADK", "length: ${items.length}")
 
 ### Interceptors
 
+An interceptor sees messages before they are delivered and decides what happens to each one. Call
+resolve to deliver the message, with or without changes, or reject to block it.
+
 ```kotlin
 adk.intercept(name) { payload, resolve, reject ->
     Log.d(
@@ -357,204 +381,200 @@ adk.intercept(name) { payload, resolve, reject ->
 }
 ```
 
-## Agent Lab
+## AI agents
 
-ART ADK provides two AI integrations:
+Chat with an agent built on ART. Each conversation takes place in a thread.
 
-- **Agent** — interact with a single AI agent.
-- **Orchestrator** — execute multi-agent workflows coordinated by an orchestrator.
-
-## Agents
-
-Agents let you drive a single conversational AI agent over its own real-time channel
-(`agent_com_<agentId>`). Each agent exposes threads; a thread runs one logical conversation
-at a time and streams typed events, terminal responses, and human-in-the-loop (HITL) feedback.
-
-> Connect and authenticate the ADK client first (see **Installation**, **Configuration**, and
-> **Quick Start** below) — agents and orchestrators run on top of an active `Adk` session.
-
-### Connect an agent
+### Start a conversation
 
 ```kotlin
-// Opens the agent_com_<agentId> subscription
-val agent = adk.agent(agentId)?.connect()
-// Open a conversation thread (each thread has a unique threadId)
-val thread = agent.thread()
-```
+val agent = adk.agent("your-agent-id")
+val thread = agent.thread()   // or agent.thread("THREAD_ID") to continue a conversation
 
-### Run a prompt
+thread.listen { envelope -> Log.d("ART", "Event: $envelope") }
 
-`thread.run(...)` starts a run and returns a `Run` handle. `run.done()` suspends until the
-agent emits its terminal `agent_output`, or throws `AgentErrorException` on `agent_error`
-or a transport failure.
+val run = thread.run("Plan a 3-day trip to Dubai")
 
-```kotlin
-lifecycleScope.launch {
-    val run = thread.run(user_input = "Summarise my last invoice")
-
-    try {
-        val output = run.done()          // suspends until final_response
-        Log.d("Agent", "Reply: ${output.message}")
-    } catch (e: AgentErrorException) {
-        Log.e("Agent", "Agent failed: ${e.message}")
-    }
+try {
+    val output = run.done()
+    Log.d("ART", output.message)
+} catch (e: Exception) {
+    Log.e("ART", "The agent couldn't finish", e)
 }
 ```
 
-### Listen to streamed events
+### Display progress
 
-Register one or more `listen` callbacks to receive every typed event on the thread.
-`evt.event` is the discriminator; the matching `evt.content` carries the typed payload.
+Use the thread's state to drive a status indicator, such as "Queued" or "Waiting for your input":
 
 ```kotlin
-lifecycleScope.launch {
-    thread.listen { evt ->
-        when (evt.event) {
-            // Terminal success — AgentOutput (type: "agent_general_response")
-            "agent_output" -> Log.d("Agent", "final: ${evt.content}")
+thread.listenState { state -> Log.d("ART", "${state.phase}: ${state.message}") }
+```
 
-            // Terminal failure — AgentError (type: "agent_error_response")
-            "agent_error" -> Log.e("Agent", "error: ${evt.content}")
+The phase is one of idle, submitted, queued, running, waitingForAgent, waitingForApproval,
+waitingForWorkspace, completed, failed or cancelled.
 
-            // Mid-run prompt for the user — HumanInputRequest (type: "human_input_request")
-            "human_input_request" -> Log.d("Agent", "needs input: ${evt.content}")
+### Answer questions from the agent
 
-            // Waiting on another agent — AgentWait (type: "agent_wait_response")
-            "agent_wait" -> Log.d("Agent", "waiting: ${evt.content}")
+An agent can pause and ask the user for more information (human-in-the-loop). Register a handler
+before you start the run, and send the answer with sendFeedback:
 
-            // Planner re-plan — PlannerCorrection (type: "planner_correction_request")
-            "planner_correction" -> Log.d("Agent", "correction: ${evt.content}")
-
-            // Anything the SDK does not model arrives as an untyped UnknownAgentEvent
-            else -> Log.d("Agent", "unknown ${evt.event}: ${evt.content}")
-        }
-    }
+```kotlin
+thread.feedbackRequest { request, run ->
+    Log.d("ART", "The agent asks: ${request.prompt}")
+    scope.launch { run.sendFeedback("Budget is 50,000, travelling in December") }
 }
 ```
 
-## Orchestrator
+## AI orchestrators
 
-Orchestrators coordinate multi-agent workflows over a dedicated channel
-(`orch_com_<orchestratorId>`). An orchestrator thread is a lightweight, event-driven channel
-you push into and listen on directly — ideal for fan-out / fan-in flows and HITL prompts
-routed through a coordinator.
-
-### Connect and open a thread
+An orchestrator coordinates several agents to complete a larger task. Start a thread, listen for its
+events, and send the user's input:
 
 ```kotlin
-// Opens the orch_com_<orchestratorId> subscription
-val orchestrator = adk.orchestrator("workflow-1").connect()
+val orchestrator = adk.orchestrator("your-orchestrator-id")
+val thread = withContext(Dispatchers.IO) { orchestrator.thread() }
 
-lifecycleScope.launch {
-    // Start a thread (pass a threadId to resume an existing one)
-    val thread = orchestrator.thread()
-    Log.d("Orch", "thread: ${thread.getId()}")
-}
-```
+thread.listen { event -> Log.d("ART", "Event: $event") }
 
-### Push and receive
+thread.listenState(callback = { state -> Log.d("ART", "Phase: ${state.phase}") })
 
-```kotlin
-lifecycleScope.launch {
-    val thread = orchestrator.thread()
-
-    // Stream every event on this thread
-    thread.listen { data ->
-        Log.d("Orch", "event: $data")
-    }
-
-    // Or bind to a single event type
-    thread.bind("agent_output") { data ->
-        Log.d("Orch", "output: $data")
-    }
-
-    // Kick off the workflow
+withContext(Dispatchers.IO) {
     thread.push(
         event = "user_input",
-        data = mapOf("user_input" to "Plan my week")
+        data = mapOf("user_input" to "Plan a 3-day trip to Goa"),
+        options = PushConfig()
     )
 }
 ```
 
-Target specific recipients or a server instance with `PushConfig`:
+If the connection fails while a request is in progress, `listen` receives an `agent_error` event
+whose details have `source: connection`, and the thread's state becomes `failed`. Call
+`thread.dispose()` when you no longer need the thread.
+
+## File storage
+
+Files are temporary media that belong to a conversation thread. Upload a file, then list, fetch or
+delete it. Each upload returns a file reference with the file's ID, name, size, content type and a
+URL for reading it.
 
 ```kotlin
-thread.push(
-    event = "user_input",
-    data = mapOf("user_input" to "hello"),
-    options = PushConfig(to = listOf("kiran"))
+val ref = adk.upload(
+    data = pngBytes, filename = "chart.png", contentType = "image/png",
+    options = UploadOptions(threadId = "THREAD_ID", allowedMimeTypes = listOf("image/png"))
 )
+
+val page = adk.listFiles(ListOptions(threadId = "THREAD_ID", page = 1, limit = 20))
+val file = adk.getFile(fileId = ref.fileId, threadId = "THREAD_ID")
+adk.deleteFile(fileId = ref.fileId)
 ```
 
-### Clean up
+Every file has an owner, which depends on where you upload it from:
 
-```kotlin
-// Remove a single listener / binding
-thread.remove(event = "agent_output")
+| **Uploaded with**                                            | **Owner**                                                                 |
+|--------------------------------------------------------------|---------------------------------------------------------------------------|
+| `adk.upload`                                                 | Your project, or the configuration you pass in `UploadOptions(configId:)` |
+| `agent.upload`, or `upload` on an agent thread               | The agent                                                                 |
+| `orchestrator.upload`, or `upload` on an orchestrator thread | The orchestrator                                                          |
+| `upload` on a channel                                        | The channel's configuration (orchestrator-enabled channels only)          |
 
-// Tear down the thread and detach all listeners
-thread.dispose()
-```      
+When an upload fails, the ADK throws an `UploadError`. Its `step` tells you which stage failed (
+`.validate`, `.upload`, `.list`, `.get` or `.delete`), and `status` holds the HTTP status code. A
+`403` means the user's role doesn't have storage permission.
 
-### Storage
-
-The Storage service allows you to manage files within your ART project. It supports uploading binary
-data, listing files, fetching file metadata/read URLs, and deleting files.
-
-### Upload a file
-
-```kotlin
-val bytes = withContext(Dispatchers.IO) {
-    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-} ?: throw IllegalStateException("could not read file")
-
-val ref = agent.upload(
-    bytes,
-    UploadOptions(
-        filename = 'my_image.jpg',
-        contentType = 'image/jpeg',
-        onProgress = { p -> progress = p },
-    )
-)
-Log.d('File ID: ${fileRef.fileId}')
-Log.d('Read URL: ${fileRef.readUrl}')
-```  
 ### List a file
 
 ```kotlin
 val a = viewModel.agent ?: return
 loadingFiles = true
 try {
-  files = a.listFiles().files.sortedByDescending { it.createdAt }
+    files = a.listFiles().files.sortedByDescending { it.createdAt }
 } catch (e: Exception) {
-  status = "List failed: ${e.message}"
+    status = "List failed: ${e.message}"
 } finally {
-  loadingFiles = false
+    loadingFiles = false
 }
 ``` 
 
 ### Delete file
+
 ```kotlin
 Storage().deleteFile(f.fileId)
-``` 
+```
 
-## API reference
+### Notifications
 
-| Class/Type          | Purpose                                                                        |
-|---------------------|--------------------------------------------------------------------------------|
-| Adk                 | Top-level facade — connect, subscribe, intercept, key management               |
-| AdkConfig           | Connection configuration (URI, credentials, auth token)                        |
-| CredentialStore     | Immutable holder for org / project / client credentials                        |
-| BaseSubscription    | Base type for all channel subscriptions (push, fetchPresence, unsubscribe)     |
-| Subscription        | Default / secure / targeted / group channel — listen(), bind(), emitter.on()   |
-| LiveObjSubscription | CRDT-backed shared-object channel — state(), query(), flush()                  |
-| CRDTProxy           | Chainable accessor for reading / mutating CRDT state                           |
-| PushConfig          | Push options — to: List<String> for targeted delivery                          |
-| KeyPairType         | KeyPairType for secure channels                                                |
-| ConnectionDetail    | Emitted on 'connection' — contains connectionId, instanceId, tenant info       |
-| Orchestrator        | Orchestrator handle bound to `orch_com_<orchestratorId>` — connect(), thread() |
-| OrchestratorThread  | Thread channel — push(), listen(), bind(), remove(), dispose(), getId()        |
-| PushConfig          | Push options — to: List<String>, instanceId, threadId                          
+Notifications are in the optional art_notifier library. Add it to your Adk instance once and keep
+the object it returns:
+
+```kotlin
+
+val inbox = adk.use(notifications(NotificationsOptions(debug = true)))
+
+// Receive new notifications as they arrive.
+inbox.onNew { n -> Log.d("ART", "New: ${n.title}") }
+
+val history = inbox.list()                 // history.notifications, history.total
+val unread = inbox.unreadCount()
+inbox.markRead()                           // marks every unread notification as read
+```
+
+### Push notifications (FCM)
+
+Register the device's FCM token so notifications reach the device when the app is in the background:
+
+```kotlin
+val devices = inbox.listDevices()
+if (devices.devices.none { it.token == fcmToken }) {
+    inbox.registerDevice(RegisterDeviceInput(token = fcmToken, platform = DevicePlatform.ANDROID))
+}
+```
+
+This needs google-services.json in your app module and the Firebase Messaging dependency.
+
+### Calling ART APIs
+
+call sends an authenticated request to an ART REST endpoint and returns the decoded JSON response:
+
+```kotlin
+val result = adk.call(
+    "/v1/some-endpoint",
+    CallApiProps(method = "POST", payload = mapOf("key" to "value")),
+    Map::class.java
+) as? Map<*, *>
+```
+
+For GET requests, pass query parameters and a base URL:
+
+```kotlin
+val result = adk.call(
+    "/api/YOUR_ORG/agent-configuration/agent/configs",
+    CallApiProps(
+        method = "GET",
+        baseUrl = "https://your-console-host",
+        queryParams = mapOf("page" to "1", "search_text" to "")
+    ),
+    Map::class.java
+) as? Map<*, *>
+```
+
+### Errors
+
+| **Error**           | **Thrown when**                                                                                                                                                                                                                             |
+|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `ConnectionError`   | The connection failed or isn't available. See [When the connection fails](#when-the-connection-fails).                                                                                                                                      |
+| `AuthHttpError`     | ART rejected a sign-in request. `status` holds the HTTP status, and `isTerminal` is `true` for rejected credentials (401 or 403).                                                                                                           |
+| `AgentError`        | An agent run failed, or ended because the connection failed                                                                                                                                                                                 |
+| `RunLifecycleError` | `run.done()` ended without an answer from the agent, because a newer run on the thread replaced it (`.superseded`) or its thread was disposed (`.closed`). `sendFeedback` also throws `.closed` when the agent isn't waiting for an answer. |
+| `UploadError`       | A storage request failed                                                                                                                                                                                                                    |
+| `ConnectorError`    | A connector ID is empty or can't be resolved, or you updated a field the connector doesn't allow                                                                                                                                            |
+| `HTTPCallError`     | An ART REST request failed in `updateProfile` or a plugin                                                                                                                                                                                   |
+| `ArtJSONError`      | Data you passed can't be converted to JSON                                                                                                                                                                                                  |
+| `ARTError`          | Other errors, for example `.invalidArgument` for an agent ID that isn't a slug, or `.serverError` when ART refuses a request or `adk.call` gets an error response                                                                           |                                                                        |
+
+## Logging
+
+The ADK doesn't print anything by default. To see its warnings and errors, set a log handler:
 
 ## Documentation
 
