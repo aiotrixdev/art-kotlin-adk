@@ -7,5 +7,6 @@ data class ChannelConfig(
     val presenceUsers: List<String> = emptyList(),
     val snapshot: Any?,
     val subscriptionID: String? = null,
-    val orchestratorEnabled: Boolean = false
+    val orchestratorEnabled: Boolean = false,
+    val configurationID: String? = null
 )

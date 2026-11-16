@@ -5,6 +5,8 @@ data class AdkConfig(
     val authToken: String? = null,
     val root: String? = null,
     val autoLoadCredsFromJSON: Boolean = false,
+    /** Maximum wait for connection readiness/control replies, not execution duration. Default 30 seconds. */
+    val connectionTimeoutMs: Number?=null,
     val getCredentials: (() -> CredentialStore)? = null
 )
 

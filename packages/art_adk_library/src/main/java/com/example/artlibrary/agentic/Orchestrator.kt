@@ -10,20 +10,24 @@ import com.example.artlibrary.storage.UploadOptions
 import com.example.artlibrary.websockets.Socket
 
 class Orchestrator(
-    val orchestratorId: String,
-    socket: Socket
+    val orchestratorId: String, socket: Socket
 ) : BaseWorkflow(socket) {
 
-    override fun channelName(): String = "orch_com_$orchestratorId"
-
-    override fun connect(): Orchestrator {
-        super.connect()
-        return this
+    init {
+        validateExecutionReference(orchestratorId)
     }
 
-    suspend fun thread(threadId: String? = null): OrchestratorThread {
+    override fun channelName(): String {
+        return "orch_com_$orchestratorId"
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    suspend fun thread(thread_id: String? = null): OrchestratorThread {
         val sub = getSubscription()
-        return OrchestratorThread(sub, threadId)
+
+        // Bypass channelConfig.orchestratorEnabled gate: this code path is
+        // entered only via adk.orchestrator(id), which is itself the opt-in.
+        return sub.threadUnchecked(thread_id)
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
